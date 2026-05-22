@@ -12,3 +12,6 @@ pydantic
 python-dotenv
 rich
 piper-tts
+mypy
+ruff
+# pvporcupine  # optional, for wake-word mode=porcupine|both

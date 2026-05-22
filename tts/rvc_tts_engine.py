@@ -334,13 +334,16 @@ class RvcTTSEngine:
             base_wav = temp_path / 'silero_base.wav'
             rvc_wav = temp_path / 'herta_rvc.wav'
 
+            print(f'(синтез базового голоса {self.config.base_tts}...)', flush=True)
             base_tts_started_at = time.perf_counter()
             self._synthesize_base_voice(normalized_text, base_wav)
             base_tts_seconds = time.perf_counter() - base_tts_started_at
+            print(f'(базовый голос готов за {base_tts_seconds:.1f}s, конверсия в голос Герты...)', flush=True)
 
             rvc_started_at = time.perf_counter()
             self._run_rvc(input_path=base_wav, output_path=rvc_wav)
             rvc_seconds = time.perf_counter() - rvc_started_at
+            print(f'(конверсия готова за {rvc_seconds:.1f}s, воспроизведение...)', flush=True)
 
             playback_started_at = time.perf_counter()
             audio, sample_rate = read_wav_for_playback(rvc_wav)

@@ -1,11 +1,13 @@
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Final, TypeVar
+from typing import Any, Callable, Final, TypeVar
 
 import httpx
 
+from actions.tool_layer import ToolCall, ToolResult, ToolSpec, build_function_declarations
 from config import GoogleAIConfig
 
 
@@ -15,6 +17,12 @@ MIN_RETRY_DELAY_SECONDS: Final[float] = 0.5
 MAX_RETRY_DELAY_SECONDS: Final[float] = 120.0
 ResponseT = TypeVar('ResponseT')
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiToolCall:
+    call: ToolCall
+    call_id: str | None = None
 
 
 class GoogleAIChatClient:
@@ -141,9 +149,15 @@ class GoogleAIChatClient:
             return
         contents.append({'role': role, 'parts': [{'text': text}]})
 
-    def _build_payload(self, messages: list[dict[str, str]]) -> dict:
+    def _build_payload(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tool_specs: list[ToolSpec] | None = None,
+        extra_contents: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         system_texts: list[str] = []
-        contents: list[dict] = []
+        contents: list[dict[str, Any]] = []
 
         for message in messages:
             text = str(message.get('content', '')).strip()
@@ -160,6 +174,9 @@ class GoogleAIChatClient:
 
         if not contents:
             self._append_content(contents, 'user', 'ping')
+
+        if extra_contents:
+            contents.extend(extra_contents)
 
         instruction_text = '\n\n'.join(system_texts)
         if instruction_text and not self.config.system_instruction_enabled:
@@ -182,31 +199,144 @@ class GoogleAIChatClient:
         if instruction_text and self.config.system_instruction_enabled:
             payload['system_instruction'] = {'parts': [{'text': instruction_text}]}
 
+        if tool_specs:
+            payload['tools'] = [
+                {
+                    'functionDeclarations': build_function_declarations(tool_specs),
+                }
+            ]
+
         return payload
 
-    def _generate_once(self, messages: list[dict[str, str]], *, model_name: str | None = None) -> httpx.Response:
+    def _generate_once(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model_name: str | None = None,
+        tool_specs: list[ToolSpec] | None = None,
+        extra_contents: list[dict[str, Any]] | None = None,
+    ) -> httpx.Response:
         return self.client.post(
             self._endpoint_url(model_name),
             headers={
                 'Content-Type': 'application/json',
                 'x-goog-api-key': self.config.api_key or '',
             },
-            json=self._build_payload(messages),
+            json=self._build_payload(messages, tool_specs=tool_specs, extra_contents=extra_contents),
         )
 
-    def _extract_content(self, response: httpx.Response) -> str:
+    def _extract_first_candidate(self, response: httpx.Response) -> dict[str, Any]:
         data = response.json()
         candidates = data.get('candidates') or []
         if not candidates:
             prompt_feedback = data.get('promptFeedback') or {}
             raise RuntimeError(f"Google AI Studio returned no candidates: {prompt_feedback}")
+        return candidates[0]
 
-        parts = candidates[0].get('content', {}).get('parts') or []
+    def _extract_content(self, response: httpx.Response) -> str:
+        candidate = self._extract_first_candidate(response)
+        parts = candidate.get('content', {}).get('parts') or []
         text = ''.join(str(part.get('text', '')) for part in parts).strip()
         if not text:
-            finish_reason = candidates[0].get('finishReason', 'unknown')
+            finish_reason = candidate.get('finishReason', 'unknown')
             raise RuntimeError(f"Google AI Studio returned no text. finish_reason={finish_reason}")
         return text
+
+    def _extract_tool_calls(self, response: httpx.Response) -> tuple[list[GeminiToolCall], dict[str, Any] | None]:
+        candidate = self._extract_first_candidate(response)
+        model_content = candidate.get('content')
+        parts = model_content.get('parts') if isinstance(model_content, dict) else []
+        tool_calls: list[GeminiToolCall] = []
+
+        for part in parts or []:
+            function_call = part.get('functionCall') if isinstance(part, dict) else None
+            if not isinstance(function_call, dict):
+                continue
+
+            name = str(function_call.get('name') or '').strip()
+            if not name:
+                continue
+            raw_args = function_call.get('args') or {}
+            arguments = raw_args if isinstance(raw_args, dict) else {}
+            call_id = function_call.get('id')
+            tool_calls.append(
+                GeminiToolCall(
+                    ToolCall(name=name, arguments=arguments),
+                    str(call_id) if call_id else None,
+                )
+            )
+
+        return tool_calls, model_content if isinstance(model_content, dict) else None
+
+    def _build_function_response_content(
+        self,
+        tool_calls: list[GeminiToolCall],
+        tool_results: list[ToolResult],
+    ) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = []
+        for tool_call, result in zip(tool_calls, tool_results, strict=True):
+            function_response = {
+                'name': tool_call.call.name,
+                'response': result.to_function_response(),
+            }
+            if tool_call.call_id:
+                function_response['id'] = tool_call.call_id
+            parts.append({'functionResponse': function_response})
+        return {'role': 'user', 'parts': parts}
+
+    def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        tool_specs: list[ToolSpec],
+        execute_tool: Callable[[ToolCall], ToolResult],
+    ) -> tuple[str, list[ToolResult]]:
+        self.warm_up()
+        active_model = self.config.model
+
+        try:
+            response = self._call_with_retry(
+                'chat with tools',
+                lambda: self._generate_once(messages, model_name=self.config.model, tool_specs=tool_specs),
+                model_name=self.config.model,
+            )
+        except RuntimeError as exc:
+            fallback_model = self.config.fallback_model
+            if not fallback_model or fallback_model == self.config.model:
+                raise
+            logger.warning(
+                "Google AI primary model '%s' failed, trying fallback model '%s' for tools: %s",
+                self.config.model,
+                fallback_model,
+                exc,
+            )
+            response = self._call_with_retry(
+                'chat with tools fallback',
+                lambda: self._generate_once(messages, model_name=fallback_model, tool_specs=tool_specs),
+                model_name=fallback_model,
+            )
+            active_model = fallback_model
+
+        tool_calls, model_content = self._extract_tool_calls(response)
+        if not tool_calls:
+            return self._extract_content(response), []
+
+        tool_results = [execute_tool(tool_call.call) for tool_call in tool_calls]
+        extra_contents: list[dict[str, Any]] = []
+        if model_content is not None:
+            extra_contents.append(model_content)
+        extra_contents.append(self._build_function_response_content(tool_calls, tool_results))
+
+        final_response = self._call_with_retry(
+            'chat after tool result',
+            lambda: self._generate_once(
+                messages,
+                model_name=active_model,
+                tool_specs=tool_specs,
+                extra_contents=extra_contents,
+            ),
+            model_name=active_model,
+        )
+        return self._extract_content(final_response), tool_results
 
     def warm_up(self) -> bool:
         if self._warmed_up:

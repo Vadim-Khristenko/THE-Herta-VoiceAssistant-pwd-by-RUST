@@ -1,12 +1,27 @@
 ﻿import argparse
 import asyncio
 import logging
+import sys
 import time
-from typing import Protocol
+from typing import Callable, Protocol
 
+if sys.platform == 'win32':
+    for _stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(_stream, 'reconfigure', None)
+        if reconfigure is not None:
+            reconfigure(encoding='utf-8', errors='replace')
+
+from actions.code_tools import CodeToolProvider
+from actions.self_check import maybe_self_check_and_repair
 from actions.system_actions import SystemActionRunner, build_system_actions_instruction
+from actions.tool_layer import ToolCall, ToolResult, ToolSpec
+from actions.web_search import WebSearchProvider
+from brain.auto_extractor import AutoFactExtractor
+from brain.long_memory import LongMemoryStore
 from brain.memory import DialogueMemory
+from brain.memory_tools import MemoryToolProvider
 from config import AppConfig, load_config
+from llm.cerebras_client import CerebrasChatClient
 from llm.deepseek_client import DeepSeekChatClient
 from llm.google_ai_client import GoogleAIChatClient
 from llm.google_live_client import GoogleLiveVoiceClient
@@ -22,6 +37,7 @@ from persona.the_herta import (
 )
 from tts.edge_tts_engine import EdgeTTSEngine
 from utils.logger import configure_logging
+from wakeword.coordinator import WakeWordCoordinator
 
 
 EXIT_COMMANDS = {"exit", "quit", "q", "выход"}
@@ -36,6 +52,15 @@ class ChatClient(Protocol):
     def warm_up(self) -> bool: ...
 
     def chat(self, messages: list[dict[str, str]]) -> str: ...
+
+
+class ToolAwareChatClient(ChatClient, Protocol):
+    def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        tool_specs: list[ToolSpec],
+        execute_tool: Callable[[ToolCall], ToolResult],
+    ) -> tuple[str, list[ToolResult]]: ...
 
 
 class TTSEngine(Protocol):
@@ -163,6 +188,21 @@ def generate_assistant_reply(
 
     inference_messages = build_inference_messages(user_text, messages)
     draft_reply = chat_client.chat(inference_messages)
+    return apply_persona_postprocessing(
+        user_text=user_text,
+        draft_reply=draft_reply,
+        chat_client=chat_client,
+        config=config,
+    )
+
+
+def apply_persona_postprocessing(
+    *,
+    user_text: str,
+    draft_reply: str,
+    chat_client: ChatClient,
+    config: AppConfig,
+) -> str:
 
     if needs_persona_repair(draft_reply):
         repaired_messages = build_persona_repair_messages(user_text, draft_reply)
@@ -177,6 +217,122 @@ def generate_assistant_reply(
     return polished_reply or draft_reply
 
 
+def _chat_client_supports_tools(chat_client: ChatClient) -> bool:
+    return callable(getattr(chat_client, 'chat_with_tools', None))
+
+
+def generate_assistant_reply_with_tools(
+    *,
+    user_text: str,
+    messages: list[dict[str, str]],
+    chat_client: ToolAwareChatClient,
+    config: AppConfig,
+    system_action_runner: SystemActionRunner,
+    logger: logging.Logger,
+) -> tuple[str, list[ToolResult]]:
+    if is_identity_query(user_text):
+        return build_identity_reply(user_text), []
+
+    inference_messages = build_inference_messages(user_text, messages)
+    draft_reply, tool_results = chat_client.chat_with_tools(
+        inference_messages,
+        system_action_runner.tool_specs(),
+        system_action_runner.execute_tool_call,
+    )
+    if tool_results:
+        logger.info(
+            "Structured tool calls handled: %s.",
+            ', '.join(f'{result.action_name}:executed={result.executed}' for result in tool_results),
+        )
+
+    return (
+        apply_persona_postprocessing(
+            user_text=user_text,
+            draft_reply=draft_reply,
+            chat_client=chat_client,
+            config=config,
+        ),
+        tool_results,
+    )
+
+
+def finish_assistant_turn(
+    *,
+    user_text: str,
+    assistant_reply: str,
+    messages: list[dict[str, str]],
+    tts_engine: TTSEngine | None,
+    config: AppConfig,
+    logger: logging.Logger,
+    locked_prefix_count: int,
+    memory_store: DialogueMemory | None,
+) -> str:
+    messages.append({"role": "assistant", "content": assistant_reply})
+    if memory_store is not None:
+        try:
+            memory_store.append_turn(user_text, assistant_reply)
+        except Exception as exc:
+            logger.warning("Failed to save dialogue memory: %s", exc)
+
+    messages[:] = trim_history(messages, config.max_history_messages, locked_prefix_count)
+
+    if tts_engine is not None:
+        try:
+            tts_engine.speak(assistant_reply)
+        except Exception as exc:  # pragma: no cover - depends on local audio/network state
+            logger.warning("TTS playback failed: %s: %r", type(exc).__name__, exc)
+
+    return assistant_reply
+
+
+
+def _maybe_followup_in_character(
+    *,
+    action_result: ToolResult,
+    user_text: str,
+    messages: list[dict[str, str]],
+    chat_client: ChatClient,
+    config: AppConfig,
+    logger: logging.Logger,
+) -> str:
+    if not action_result.executed:
+        return action_result.message
+
+    needs_followup = bool(action_result.data.get('needs_followup'))
+    if not needs_followup:
+        return action_result.message
+
+    if not config.web_search.followup_in_character:
+        return action_result.message
+
+    prompt_block = str(action_result.data.get('prompt_block') or action_result.message).strip()
+    if not prompt_block:
+        return action_result.message
+
+    followup_messages = list(messages) + [
+        {
+            "role": "system",
+            "content": (
+                "Тебе вернули результаты внешнего поиска. Сформулируй ответ пользователю своим голосом - "
+                "коротко, по делу, без перечисления ссылок и без фразы 'я нашла в интернете'. "
+                "Если данные противоречивы или устарели - отметь это. Не выдумывай факты сверх того, что в результатах."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Запрос пользователя: {user_text!r}\n\nРезультаты поиска:\n{prompt_block}",
+        },
+    ]
+
+    logger.info("Web search followup: paraphrasing %d chars of results in character.", len(prompt_block))
+    try:
+        followup_reply = chat_client.chat(followup_messages)
+    except Exception as exc:
+        logger.warning("Web search followup failed: %s", exc)
+        return action_result.message
+
+    return followup_reply.strip() or action_result.message
+
 
 def run_turn(
     *,
@@ -189,29 +345,85 @@ def run_turn(
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
     system_action_runner: SystemActionRunner | None,
+    code_tool_provider: CodeToolProvider | None = None,
 ) -> str:
     messages.append({"role": "user", "content": user_text})
 
+    blocked_action = system_action_runner.block_if_unsafe(user_text) if system_action_runner is not None else None
+    if blocked_action is not None:
+        logger.info(
+            "System action blocked: action=%s, executed=%s.",
+            blocked_action.action_name,
+            blocked_action.executed,
+        )
+        return finish_assistant_turn(
+            user_text=user_text,
+            assistant_reply=blocked_action.message,
+            messages=messages,
+            tts_engine=tts_engine,
+            config=config,
+            logger=logger,
+            locked_prefix_count=locked_prefix_count,
+            memory_store=memory_store,
+        )
+
+    if (
+        system_action_runner is not None
+        and config.system_actions.enabled
+        and _chat_client_supports_tools(chat_client)
+    ):
+        logger.info(
+            "Generating reply with %s model '%s' and structured tools...",
+            config.llm_provider,
+            _selected_model_name(config),
+        )
+        started_at = time.perf_counter()
+        try:
+            assistant_reply, _tool_results = generate_assistant_reply_with_tools(
+                user_text=user_text,
+                messages=messages,
+                chat_client=chat_client,  # type: ignore[arg-type]
+                config=config,
+                system_action_runner=system_action_runner,
+                logger=logger,
+            )
+        except RuntimeError as exc:
+            logger.warning("Structured tool calling failed; falling back to local parser/plain chat: %s", exc)
+        else:
+            elapsed_seconds = time.perf_counter() - started_at
+            logger.info("Assistant reply ready in %.1fs.", elapsed_seconds)
+            return finish_assistant_turn(
+                user_text=user_text,
+                assistant_reply=assistant_reply,
+                messages=messages,
+                tts_engine=tts_engine,
+                config=config,
+                logger=logger,
+                locked_prefix_count=locked_prefix_count,
+                memory_store=memory_store,
+            )
+
     action_result = system_action_runner.handle(user_text) if system_action_runner is not None else None
     if action_result is not None:
-        assistant_reply = action_result.message
         logger.info("System action handled: action=%s, executed=%s.", action_result.action_name, action_result.executed)
-        messages.append({"role": "assistant", "content": assistant_reply})
-        if memory_store is not None:
-            try:
-                memory_store.append_turn(user_text, assistant_reply)
-            except Exception as exc:
-                logger.warning("Failed to save dialogue memory: %s", exc)
-
-        messages[:] = trim_history(messages, config.max_history_messages, locked_prefix_count)
-
-        if tts_engine is not None:
-            try:
-                tts_engine.speak(assistant_reply)
-            except Exception as exc:  # pragma: no cover - depends on local audio/network state
-                logger.warning("TTS playback failed: %s", exc)
-
-        return assistant_reply
+        assistant_reply = _maybe_followup_in_character(
+            action_result=action_result,
+            user_text=user_text,
+            messages=messages,
+            chat_client=chat_client,
+            config=config,
+            logger=logger,
+        )
+        return finish_assistant_turn(
+            user_text=user_text,
+            assistant_reply=assistant_reply,
+            messages=messages,
+            tts_engine=tts_engine,
+            config=config,
+            logger=logger,
+            locked_prefix_count=locked_prefix_count,
+            memory_store=memory_store,
+        )
 
     logger.info(
         "Generating reply with %s model '%s'...",
@@ -228,22 +440,24 @@ def run_turn(
     elapsed_seconds = time.perf_counter() - started_at
     logger.info("Assistant reply ready in %.1fs.", elapsed_seconds)
 
-    messages.append({"role": "assistant", "content": assistant_reply})
-    if memory_store is not None:
-        try:
-            memory_store.append_turn(user_text, assistant_reply)
-        except Exception as exc:
-            logger.warning("Failed to save dialogue memory: %s", exc)
+    assistant_reply = maybe_self_check_and_repair(
+        reply=assistant_reply,
+        messages=messages,
+        chat_client=chat_client,
+        config=config.code_tools,
+        provider=code_tool_provider,
+    )
 
-    messages[:] = trim_history(messages, config.max_history_messages, locked_prefix_count)
-
-    if tts_engine is not None:
-        try:
-            tts_engine.speak(assistant_reply)
-        except Exception as exc:  # pragma: no cover - depends on local audio/network state
-            logger.warning("TTS playback failed: %s", exc)
-
-    return assistant_reply
+    return finish_assistant_turn(
+        user_text=user_text,
+        assistant_reply=assistant_reply,
+        messages=messages,
+        tts_engine=tts_engine,
+        config=config,
+        logger=logger,
+        locked_prefix_count=locked_prefix_count,
+        memory_store=memory_store,
+    )
 
 
 
@@ -257,6 +471,8 @@ def interactive_loop(
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
     system_action_runner: SystemActionRunner | None,
+    auto_extractor: AutoFactExtractor | None = None,
+    code_tool_provider: CodeToolProvider | None = None,
 ) -> None:
     print("The Herta assistant ready. Type a message or 'exit' to quit.")
 
@@ -284,12 +500,18 @@ def interactive_loop(
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
                 system_action_runner=system_action_runner,
+                code_tool_provider=code_tool_provider,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
             continue
 
         print(f"The Herta> {assistant_reply}")
+
+        if auto_extractor is not None:
+            added = auto_extractor.on_turn_complete(messages)
+            if added:
+                print(f"(долговременная память: +{added} факт(ов))")
 
 
 def _prepare_stt_engine(config: AppConfig, logger: logging.Logger) -> STTEngine:
@@ -342,6 +564,8 @@ def voice_loop(
     locked_prefix_count: int,
     memory_store: DialogueMemory | None,
     system_action_runner: SystemActionRunner | None,
+    auto_extractor: AutoFactExtractor | None = None,
+    code_tool_provider: CodeToolProvider | None = None,
 ) -> None:
     from audio.input import MicrophoneInput
     from audio.vad import StreamingVADSegmenter
@@ -372,57 +596,99 @@ def voice_loop(
 
     microphone = MicrophoneInput(config.audio)
     vad_segmenter = StreamingVADSegmenter(config.audio, config.vad)
+    wake_coordinator = WakeWordCoordinator(config.wakeword)
+
+    if wake_coordinator.enabled:
+        sources = []
+        if wake_coordinator.porcupine_active:
+            sources.append('porcupine')
+        if config.wakeword.mode in ('text', 'both'):
+            sources.append(f"text({'/'.join(config.wakeword.phrases)})")
+        print(
+            f"Wake word active. mode={config.wakeword.mode}, sources=[{', '.join(sources) or 'none'}], "
+            f"follow_up={config.wakeword.follow_up_seconds:.1f}s."
+        )
+    else:
+        print("Wake word disabled. Every utterance will be processed.")
 
     print(
         f"Voice mode ready. device={config.audio.device!r}, sample_rate={config.audio.sample_rate}, "
         f"block_size={config.audio.block_size}. Speak into the microphone. Press Ctrl+C to stop."
     )
 
-    with microphone:
-        while True:
-            try:
-                chunk = microphone.read_chunk(timeout=1.0)
-            except (KeyboardInterrupt, EOFError):
-                print()
-                break
+    try:
+        with microphone:
+            while True:
+                try:
+                    chunk = microphone.read_chunk(timeout=1.0)
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    break
 
-            if chunk is None:
-                continue
+                if chunk is None:
+                    continue
 
-            utterance = vad_segmenter.process_chunk(chunk)
-            if utterance is None:
-                continue
+                if wake_coordinator.porcupine_active and not wake_coordinator.is_armed():
+                    if wake_coordinator.process_audio_chunk(chunk):
+                        print("(пробуждение)")
+                        vad_segmenter.reset()
 
-            microphone.clear_queue()
+                utterance = vad_segmenter.process_chunk(chunk)
+                if utterance is None:
+                    continue
 
-            try:
-                transcript = stt_engine.transcribe(utterance)
-            except Exception as exc:
-                logger.error("STT failed: %s", exc)
-                continue
+                microphone.clear_queue()
 
-            if not transcript:
-                continue
+                try:
+                    transcript = stt_engine.transcribe(utterance)
+                except Exception as exc:
+                    logger.error("STT failed: %s", exc)
+                    continue
 
-            print(f"You> {transcript}")
+                if not transcript:
+                    continue
 
-            try:
-                assistant_reply = run_turn(
-                    user_text=transcript,
-                    messages=messages,
-                    chat_client=chat_client,
-                    tts_engine=tts_engine,
-                    config=config,
-                    logger=logger,
-                    locked_prefix_count=locked_prefix_count,
-                    memory_store=memory_store,
-                    system_action_runner=system_action_runner,
-                )
-            except Exception as exc:
-                logger.error("Assistant turn failed: %s", exc)
-                continue
+                should_process, command_text, wake_word_only = wake_coordinator.process_transcript(transcript)
 
-            print(f"The Herta> {assistant_reply}")
+                if wake_word_only:
+                    print(f"(слушаю, жду команду) heard={transcript!r}")
+                    continue
+                if not should_process:
+                    print(f"(пропущено — нет обращения по имени) heard={transcript!r}")
+                    continue
+
+                print(f"You> {command_text}")
+                print("(думаю...)", flush=True)
+
+                try:
+                    assistant_reply = run_turn(
+                        user_text=command_text,
+                        messages=messages,
+                        chat_client=chat_client,
+                        tts_engine=tts_engine,
+                        config=config,
+                        logger=logger,
+                        locked_prefix_count=locked_prefix_count,
+                        memory_store=memory_store,
+                        system_action_runner=system_action_runner,
+                        code_tool_provider=code_tool_provider,
+                    )
+                except Exception as exc:
+                    logger.error("Assistant turn failed: %s", exc)
+                    continue
+
+                print(f"The Herta> {assistant_reply}")
+
+                if auto_extractor is not None:
+                    added = auto_extractor.on_turn_complete(messages)
+                    if added:
+                        print(f"(долговременная память: +{added} факт(ов))")
+
+                wake_coordinator.arm()
+                microphone.clear_queue()
+                vad_segmenter.reset()
+    finally:
+        wake_coordinator.close()
 
 
 def google_live_voice_loop(
@@ -459,13 +725,28 @@ def google_live_voice_loop(
         print("Google Live playback mode: RVC. Google audio is ignored; output transcript is spoken by local RVC.")
     else:
         print("Google Live playback mode: Google native audio.")
+    live_tool_specs = system_action_runner.tool_specs() if system_action_runner is not None and config.system_actions.enabled else None
+    live_tool_executor = (
+        system_action_runner.execute_tool_call
+        if system_action_runner is not None and config.system_actions.enabled
+        else None
+    )
+    fallback_live_actions = (
+        system_action_runner.block_if_unsafe
+        if live_tool_specs and system_action_runner is not None
+        else system_action_runner.handle if system_action_runner is not None else None
+    )
+    if live_tool_specs:
+        print(f"Google Live structured tools enabled: {len(live_tool_specs)} tools.")
     asyncio.run(
         client.run_voice_loop(
             messages=messages,
             audio_config=config.audio,
             audio_output_config=config.audio_output,
             memory_store=memory_store,
-            system_action_runner=(system_action_runner.handle if system_action_runner is not None else None),
+            system_action_runner=fallback_live_actions,
+            tool_specs=live_tool_specs,
+            execute_tool=live_tool_executor,
             transcript_tts=tts_engine if config.google_ai.live_playback == 'rvc' else None,
         )
     )
@@ -533,6 +814,8 @@ def _describe_output_device(device: int | str | None) -> str:
 def _selected_model_name(config: AppConfig) -> str:
     if config.llm_provider == "deepseek":
         return config.deepseek.model
+    if config.llm_provider == "cerebras":
+        return config.cerebras.model
     if config.llm_provider in GOOGLE_AI_PROVIDER_NAMES:
         return config.google_ai.model
     return config.ollama.model
@@ -543,9 +826,11 @@ def _build_chat_client(config: AppConfig) -> ChatClient:
         return OllamaChatClient(config.ollama)
     if config.llm_provider == "deepseek":
         return DeepSeekChatClient(config.deepseek)
+    if config.llm_provider == "cerebras":
+        return CerebrasChatClient(config.cerebras)
     if config.llm_provider in GOOGLE_AI_PROVIDER_NAMES:
         return GoogleAIChatClient(config.google_ai)
-    raise ValueError("Unsupported LLM_PROVIDER. Use 'ollama', 'deepseek', or 'google_ai'.")
+    raise ValueError("Unsupported LLM_PROVIDER. Use 'ollama', 'deepseek', 'cerebras', or 'google_ai'.")
 
 
 def _build_tts_engine(config: AppConfig, *, no_tts: bool, live_voice: bool) -> TTSEngine | None:
@@ -639,7 +924,57 @@ def main() -> int:
         print(f"Configured output device: {_describe_output_device(config.audio_output.device)}")
         print(f"Piper model: {config.tts.piper_model_path!r}")
 
-    system_action_runner = SystemActionRunner(config.system_actions, logger)
+    long_memory_store = LongMemoryStore(config.long_memory) if config.long_memory.enabled else None
+    extra_runner_tools: list = []
+    if long_memory_store is not None:
+        extra_runner_tools.extend(MemoryToolProvider(long_memory_store).callable_tools())
+        fact_count = len(long_memory_store.all_facts())
+        logger.info(
+            "Long-term memory ready. path=%s, facts=%d, auto_extract=%s.",
+            long_memory_store.path,
+            fact_count,
+            config.long_memory.auto_extract_enabled,
+        )
+        print(f"Long-term memory: {fact_count} fact(s) loaded from {long_memory_store.path}.")
+
+    web_search_provider = WebSearchProvider(config.web_search) if config.web_search.enabled else None
+    if web_search_provider is not None:
+        if not web_search_provider.enabled:
+            logger.warning("Web search is enabled but API key is missing; tool will not work.")
+        else:
+            search_tools = web_search_provider.callable_tools()
+            extra_runner_tools.extend(search_tools)
+            logger.info(
+                "Web search ready. provider=%s, max_results=%d, followup_in_character=%s.",
+                config.web_search.provider,
+                config.web_search.max_results,
+                config.web_search.followup_in_character,
+            )
+            print(
+                f"Web search: {config.web_search.provider} "
+                f"({'followup-in-character' if config.web_search.followup_in_character else 'raw'})."
+            )
+
+    code_tool_provider = CodeToolProvider(config.code_tools) if config.code_tools.enabled else None
+    if code_tool_provider is not None:
+        code_tools = code_tool_provider.callable_tools()
+        extra_runner_tools.extend(code_tools)
+        logger.info(
+            "Code tools ready. project_root=%s, self_check=%s, tools=%d.",
+            code_tool_provider.project_root,
+            config.code_tools.self_check_enabled,
+            len(code_tools),
+        )
+        print(
+            f"Code tools: mypy + ruff (project={code_tool_provider.project_root}, "
+            f"self_check={'on' if config.code_tools.self_check_enabled else 'off'})."
+        )
+
+    system_action_runner = SystemActionRunner(
+        config.system_actions,
+        logger,
+        extra_tools=extra_runner_tools,
+    )
     if config.system_actions.enabled:
         print(
             "System actions enabled: browser, VS Code, and safe .txt creation only. "
@@ -665,9 +1000,16 @@ def main() -> int:
         )
 
     selected_model_name = config.google_ai.live_model if args.live_voice else _selected_model_name(config)
-    messages = build_bootstrap_messages(selected_model_name)
+    long_memory_block = long_memory_store.format_for_prompt() if long_memory_store is not None else ''
+    messages = build_bootstrap_messages(selected_model_name, long_memory_block=long_memory_block or None)
     if config.system_actions.enabled:
-        messages.append({"role": "system", "content": build_system_actions_instruction()})
+        provider_supports_tools = config.llm_provider in GOOGLE_AI_PROVIDER_NAMES or args.live_voice
+        messages.append(
+            {
+                "role": "system",
+                "content": build_system_actions_instruction(structured_tools_available=provider_supports_tools),
+            }
+        )
     locked_prefix_count = len(messages)
     memory_store = _build_memory_store(config, logger)
     if memory_store is not None:
@@ -694,6 +1036,18 @@ def main() -> int:
 
     chat_client = _build_chat_client(config)
 
+    auto_extractor: AutoFactExtractor | None = None
+    if long_memory_store is not None and config.long_memory.auto_extract_enabled:
+        auto_extractor = AutoFactExtractor(
+            long_memory_store,
+            chat_client,
+            interval_turns=config.long_memory.auto_extract_every_turns,
+        )
+        logger.info(
+            "Auto fact extractor active: every %d turns.",
+            config.long_memory.auto_extract_every_turns,
+        )
+
     if args.text:
         try:
             assistant_reply = run_turn(
@@ -706,6 +1060,7 @@ def main() -> int:
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
                 system_action_runner=system_action_runner,
+                code_tool_provider=code_tool_provider,
             )
         except Exception as exc:
             logger.error("Assistant turn failed: %s", exc)
@@ -725,6 +1080,8 @@ def main() -> int:
                 locked_prefix_count=locked_prefix_count,
                 memory_store=memory_store,
                 system_action_runner=system_action_runner,
+                auto_extractor=auto_extractor,
+                code_tool_provider=code_tool_provider,
             )
         except Exception as exc:
             logger.error("Voice loop failed: %s", exc)
@@ -740,6 +1097,8 @@ def main() -> int:
         locked_prefix_count=locked_prefix_count,
         memory_store=memory_store,
         system_action_runner=system_action_runner,
+        auto_extractor=auto_extractor,
+        code_tool_provider=code_tool_provider,
     )
     return 0
 

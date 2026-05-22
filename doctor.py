@@ -19,6 +19,7 @@ LIVE_MODEL_NAMES = {
     'gemini-2.5-flash-native-audio-preview-12-2025',
 }
 VALID_LIVE_PLAYBACK_MODES = {'google', 'rvc'}
+VALID_WAKEWORD_MODES = {'text', 'porcupine', 'both'}
 VALID_RVC_BACKENDS = {'persistent', 'worker', 'subprocess', 'cli'}
 VALID_RVC_BASE_TTS = {'silero', 'piper'}
 VALID_RVC_F0_METHODS = {'rmvpe', 'fcpe', 'crepe', 'crepe-tiny'}
@@ -68,6 +69,10 @@ def run_doctor(config: AppConfig) -> int:
     _check_models(report, config)
     _check_audio(report, config)
     _check_memory(report, config)
+    _check_long_memory(report, config)
+    _check_code_tools(report, config)
+    _check_web_search(report, config)
+    _check_wakeword(report, config)
     _check_system_actions(report, config)
     _check_rvc(report, config)
     report.print()
@@ -97,6 +102,8 @@ def _check_imports(report: DoctorReport, config: AppConfig) -> None:
 
     if config.llm_provider == 'ollama':
         required_modules.append(('ollama', 'ollama'))
+    if config.llm_provider in {'deepseek', 'cerebras'}:
+        required_modules.append(('openai', 'openai'))
     if config.stt_provider in {'whisper', 'faster_whisper', 'faster-whisper'}:
         required_modules.append(('faster_whisper', 'faster-whisper'))
         required_modules.append(('silero_vad', 'silero-vad'))
@@ -142,8 +149,8 @@ def _check_models(report: DoctorReport, config: AppConfig) -> None:
     elif live_playback == 'rvc':
         report.ok('Live RVC playback', 'enabled.')
 
-    if config.llm_provider not in {'ollama', 'deepseek', *{'google_ai', 'google', 'gemini'}}:
-        report.fail('LLM provider', f"{config.llm_provider!r}; use ollama, deepseek, or google_ai.")
+    if config.llm_provider not in {'ollama', 'deepseek', 'cerebras', *{'google_ai', 'google', 'gemini'}}:
+        report.fail('LLM provider', f"{config.llm_provider!r}; use ollama, deepseek, cerebras, or google_ai.")
     else:
         report.ok('LLM provider', config.llm_provider)
 
@@ -224,6 +231,115 @@ def _check_memory(report: DoctorReport, config: AppConfig) -> None:
         report.ok('Dialogue memory limits', f'context={config.memory.context_messages}, max={config.memory.max_messages}.')
 
 
+def _check_long_memory(report: DoctorReport, config: AppConfig) -> None:
+    if not config.long_memory.enabled:
+        report.warn('Long-term memory', 'disabled; Herta will not retain facts between sessions.')
+        return
+
+    from brain.long_memory import LongMemoryStore
+
+    try:
+        store = LongMemoryStore(config.long_memory)
+        fact_count = len(store.all_facts())
+    except Exception as exc:
+        report.fail('Long-term memory', f'failed to initialize: {exc}')
+        return
+
+    auto_status = (
+        f"auto-extract every {config.long_memory.auto_extract_every_turns} turn(s)"
+        if config.long_memory.auto_extract_enabled
+        else "auto-extract off"
+    )
+    report.ok(
+        'Long-term memory',
+        f"path={store.path}; facts={fact_count}/{config.long_memory.max_facts}; {auto_status}.",
+    )
+
+
+def _check_code_tools(report: DoctorReport, config: AppConfig) -> None:
+    if not config.code_tools.enabled:
+        report.warn('Code tools', 'disabled; mypy/ruff tools and self-check unavailable.')
+        return
+
+    project_root = Path(config.code_tools.project_root).resolve()
+    if not project_root.exists() or not project_root.is_dir():
+        report.fail('Code tools project root', f'not a directory: {project_root}.')
+        return
+
+    report.ok('Code tools project root', str(project_root))
+
+    if not _module_exists('mypy'):
+        report.fail('mypy', "module is missing. Run: python -m pip install mypy")
+    else:
+        report.ok('mypy', 'importable.')
+
+    if not _module_exists('ruff'):
+        report.fail('ruff', "module is missing. Run: python -m pip install ruff")
+    else:
+        report.ok('ruff', 'importable.')
+
+    self_check_state = 'on' if config.code_tools.self_check_enabled else 'off'
+    report.ok(
+        'Code self-check',
+        f"{self_check_state} (max_snippets={config.code_tools.self_check_max_snippets}, min_lines={config.code_tools.self_check_min_lines}).",
+    )
+
+
+def _check_web_search(report: DoctorReport, config: AppConfig) -> None:
+    if not config.web_search.enabled:
+        report.warn('Web search', 'disabled.')
+        return
+
+    if config.web_search.provider != 'tavily':
+        report.warn('Web search provider', f"{config.web_search.provider!r}; only 'tavily' is currently implemented.")
+        return
+
+    if not config.web_search.api_key:
+        report.fail('Web search', 'TAVILY_API_KEY is not configured.')
+        return
+
+    followup = 'followup-in-character' if config.web_search.followup_in_character else 'raw'
+    report.ok(
+        'Web search',
+        f"provider={config.web_search.provider}, max_results={config.web_search.max_results}, mode={followup}.",
+    )
+
+
+def _check_wakeword(report: DoctorReport, config: AppConfig) -> None:
+    if not config.wakeword.enabled:
+        report.warn('Wake word', 'disabled; every utterance is processed.')
+        return
+
+    if config.wakeword.mode not in VALID_WAKEWORD_MODES:
+        report.fail('Wake word mode', f"{config.wakeword.mode!r}; use one of {sorted(VALID_WAKEWORD_MODES)}.")
+        return
+
+    report.ok('Wake word mode', config.wakeword.mode)
+
+    if config.wakeword.mode in ('text', 'both'):
+        if not config.wakeword.phrases:
+            report.fail('Wake word phrases', 'empty list; set WAKEWORD_PHRASES.')
+        else:
+            report.ok('Wake word phrases', ', '.join(config.wakeword.phrases))
+
+    if config.wakeword.mode in ('porcupine', 'both'):
+        if not _module_exists('pvporcupine'):
+            report.fail('pvporcupine', "module is missing. Run: python -m pip install pvporcupine")
+        else:
+            report.ok('pvporcupine', 'importable.')
+
+        if not config.wakeword.porcupine_access_key:
+            report.fail('Porcupine access key', 'PORCUPINE_ACCESS_KEY is empty.')
+        else:
+            report.ok('Porcupine access key', 'configured.')
+
+        if not config.wakeword.porcupine_keyword_paths:
+            report.fail('Porcupine keywords', 'PORCUPINE_KEYWORD_PATHS is empty.')
+        else:
+            for keyword_path in config.wakeword.porcupine_keyword_paths:
+                _check_path_exists(report, f"Porcupine keyword '{Path(keyword_path).name}'", Path(keyword_path), expect_dir=False)
+
+
 def _check_system_actions(report: DoctorReport, config: AppConfig) -> None:
     if not config.system_actions.enabled:
         report.warn('System actions', 'disabled.')
@@ -236,6 +352,7 @@ def _check_system_actions(report: DoctorReport, config: AppConfig) -> None:
         return
 
     report.ok('System actions', f'enabled; root={runner.root_dir}; registry={runner.registry_path}.')
+    report.ok('Tool registry', f'{len(runner.tool_specs())} tools registered.')
     if shutil.which(config.system_actions.vscode_command):
         report.ok('VS Code command', f"{config.system_actions.vscode_command!r} found in PATH.")
     else:

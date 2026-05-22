@@ -79,6 +79,18 @@ class DeepSeekConfig:
 
 
 @dataclass(slots=True)
+class CerebrasConfig:
+    api_key: str | None = None
+    base_url: str = 'https://api.cerebras.ai/v1'
+    model: str = 'llama-3.3-70b'
+    timeout_seconds: float = 60.0
+    temperature: float = 0.55
+    max_tokens: int = 700
+    retry_attempts: int = 4
+    rate_limit_retries: int = 2
+
+
+@dataclass(slots=True)
 class GoogleAIConfig:
     api_key: str | None = None
     base_url: str = 'https://generativelanguage.googleapis.com/v1beta'
@@ -215,6 +227,54 @@ class MemoryConfig:
 
 
 @dataclass(slots=True)
+class WebSearchConfig:
+    enabled: bool = False
+    provider: str = 'tavily'
+    api_key: str | None = None
+    max_results: int = 5
+    timeout_seconds: float = 15.0
+    search_depth: str = 'basic'
+    followup_in_character: bool = True
+
+
+@dataclass(slots=True)
+class CodeToolsConfig:
+    enabled: bool = False
+    project_root: str = '.'
+    mypy_args: tuple[str, ...] = (
+        '--no-color-output',
+        '--show-error-codes',
+        '--no-error-summary',
+        '--ignore-missing-imports',
+    )
+    ruff_args: tuple[str, ...] = ('check', '--no-cache', '--select=E,F,W,UP,B,SIM')
+    timeout_seconds: int = 30
+    self_check_enabled: bool = False
+    self_check_max_snippets: int = 2
+    self_check_min_lines: int = 3
+
+
+@dataclass(slots=True)
+class LongMemoryConfig:
+    enabled: bool = True
+    path: str = 'data/long_memory.json'
+    max_facts: int = 200
+    auto_extract_enabled: bool = True
+    auto_extract_every_turns: int = 6
+
+
+@dataclass(slots=True)
+class WakeWordConfig:
+    enabled: bool = False
+    mode: str = 'text'
+    phrases: tuple[str, ...] = ('герта', 'великая герта', 'эй герта', 'слушай герта', 'herta')
+    follow_up_seconds: float = 10.0
+    porcupine_access_key: str | None = None
+    porcupine_keyword_paths: tuple[str, ...] = ()
+    porcupine_sensitivity: float = 0.5
+
+
+@dataclass(slots=True)
 class SystemActionsConfig:
     enabled: bool = False
     document_dir: str = 'desktop'
@@ -233,6 +293,7 @@ class AppConfig:
     persona_rewrite_enabled: bool = False
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
+    cerebras: CerebrasConfig = field(default_factory=CerebrasConfig)
     google_ai: GoogleAIConfig = field(default_factory=GoogleAIConfig)
     google_stt: GoogleSTTConfig = field(default_factory=GoogleSTTConfig)
     tts: EdgeTTSConfig = field(default_factory=EdgeTTSConfig)
@@ -242,6 +303,10 @@ class AppConfig:
     vad: VadConfig = field(default_factory=VadConfig)
     stt: WhisperSTTConfig = field(default_factory=WhisperSTTConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    long_memory: LongMemoryConfig = field(default_factory=LongMemoryConfig)
+    code_tools: CodeToolsConfig = field(default_factory=CodeToolsConfig)
+    web_search: WebSearchConfig = field(default_factory=WebSearchConfig)
+    wakeword: WakeWordConfig = field(default_factory=WakeWordConfig)
     system_actions: SystemActionsConfig = field(default_factory=SystemActionsConfig)
 
 
@@ -271,6 +336,16 @@ def load_config() -> AppConfig:
             max_tokens=int(os.getenv('DEEPSEEK_MAX_TOKENS', '700')),
             retry_attempts=int(os.getenv('DEEPSEEK_RETRY_ATTEMPTS', '4')),
             rate_limit_retries=int(os.getenv('DEEPSEEK_RATE_LIMIT_RETRIES', '2')),
+        ),
+        cerebras=CerebrasConfig(
+            api_key=_get_optional_str(os.getenv('CEREBRAS_API_KEY')),
+            base_url=os.getenv('CEREBRAS_BASE_URL', 'https://api.cerebras.ai/v1'),
+            model=os.getenv('CEREBRAS_MODEL', 'llama-3.3-70b'),
+            timeout_seconds=float(os.getenv('CEREBRAS_TIMEOUT_SECONDS', '60')),
+            temperature=float(os.getenv('CEREBRAS_TEMPERATURE', '0.55')),
+            max_tokens=int(os.getenv('CEREBRAS_MAX_TOKENS', '700')),
+            retry_attempts=int(os.getenv('CEREBRAS_RETRY_ATTEMPTS', '4')),
+            rate_limit_retries=int(os.getenv('CEREBRAS_RATE_LIMIT_RETRIES', '2')),
         ),
         google_ai=GoogleAIConfig(
             api_key=_get_optional_str(os.getenv('GOOGLE_AI_API_KEY')) or _get_optional_str(os.getenv('GEMINI_API_KEY')),
@@ -393,6 +468,50 @@ def load_config() -> AppConfig:
             path=os.getenv('MEMORY_PATH', 'data/dialogue_memory.json'),
             max_messages=int(os.getenv('MEMORY_MAX_MESSAGES', '80')),
             context_messages=int(os.getenv('MEMORY_CONTEXT_MESSAGES', '12')),
+        ),
+        web_search=WebSearchConfig(
+            enabled=_get_bool(os.getenv('WEB_SEARCH_ENABLED'), False),
+            provider=os.getenv('WEB_SEARCH_PROVIDER', 'tavily').strip().lower(),
+            api_key=_get_optional_str(os.getenv('TAVILY_API_KEY') or os.getenv('WEB_SEARCH_API_KEY')),
+            max_results=int(os.getenv('WEB_SEARCH_MAX_RESULTS', '5')),
+            timeout_seconds=float(os.getenv('WEB_SEARCH_TIMEOUT_SECONDS', '15')),
+            search_depth=os.getenv('WEB_SEARCH_DEPTH', 'basic').strip().lower(),
+            followup_in_character=_get_bool(os.getenv('WEB_SEARCH_FOLLOWUP_IN_CHARACTER'), True),
+        ),
+        code_tools=CodeToolsConfig(
+            enabled=_get_bool(os.getenv('CODE_TOOLS_ENABLED'), False),
+            project_root=os.getenv('CODE_TOOLS_PROJECT_ROOT', '.'),
+            timeout_seconds=int(os.getenv('CODE_TOOLS_TIMEOUT_SECONDS', '30')),
+            self_check_enabled=_get_bool(os.getenv('CODE_TOOLS_SELF_CHECK'), False),
+            self_check_max_snippets=int(os.getenv('CODE_TOOLS_SELF_CHECK_MAX_SNIPPETS', '2')),
+            self_check_min_lines=int(os.getenv('CODE_TOOLS_SELF_CHECK_MIN_LINES', '3')),
+        ),
+        long_memory=LongMemoryConfig(
+            enabled=_get_bool(os.getenv('LONG_MEMORY_ENABLED'), True),
+            path=os.getenv('LONG_MEMORY_PATH', 'data/long_memory.json'),
+            max_facts=int(os.getenv('LONG_MEMORY_MAX_FACTS', '200')),
+            auto_extract_enabled=_get_bool(os.getenv('LONG_MEMORY_AUTO_EXTRACT'), True),
+            auto_extract_every_turns=int(os.getenv('LONG_MEMORY_AUTO_EXTRACT_EVERY_TURNS', '6')),
+        ),
+        wakeword=WakeWordConfig(
+            enabled=_get_bool(os.getenv('WAKEWORD_ENABLED'), False),
+            mode=os.getenv('WAKEWORD_MODE', 'text').strip().lower(),
+            phrases=tuple(
+                phrase.strip().lower()
+                for phrase in os.getenv(
+                    'WAKEWORD_PHRASES',
+                    'герта,великая герта,эй герта,слушай герта,herta',
+                ).split(',')
+                if phrase.strip()
+            ),
+            follow_up_seconds=float(os.getenv('WAKEWORD_FOLLOW_UP_SECONDS', '10')),
+            porcupine_access_key=_get_optional_str(os.getenv('PORCUPINE_ACCESS_KEY')),
+            porcupine_keyword_paths=tuple(
+                path.strip()
+                for path in os.getenv('PORCUPINE_KEYWORD_PATHS', '').split(',')
+                if path.strip()
+            ),
+            porcupine_sensitivity=float(os.getenv('PORCUPINE_SENSITIVITY', '0.5')),
         ),
         system_actions=SystemActionsConfig(
             enabled=_get_bool(os.getenv('SYSTEM_ACTIONS_ENABLED'), False),

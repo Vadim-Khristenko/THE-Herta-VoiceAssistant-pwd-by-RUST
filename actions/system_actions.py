@@ -7,11 +7,11 @@ import re
 import shutil
 import subprocess
 import webbrowser
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote_plus
 
+from actions.tool_layer import CallableTool, ToolCall, ToolParameter, ToolRegistry, ToolResult, ToolSpec
 from config import SystemActionsConfig
 
 
@@ -31,6 +31,94 @@ CREATE_WORDS = ('создай', 'создать', 'сделай', 'заведи'
 WRITE_WORDS = ('запиши', 'допиши', 'добавь', 'внеси', 'заполни', 'напиши')
 RENAME_WORDS = ('переименуй', 'переименовать')
 SEARCH_MARKERS = ('загугли', 'найди в интернете', 'найди в браузере', 'поиск в браузере')
+REMEMBER_TRIGGERS = ('запомни', 'запомнить', 'сохрани в памяти', 'сохрани факт', 'отложи в память')
+RECALL_TRIGGERS = (
+    'что ты помнишь',
+    'что ты обо мне помнишь',
+    'что обо мне помнишь',
+    'что ты знаешь обо мне',
+    'что ты обо мне знаешь',
+    'что у тебя в памяти',
+    'покажи память',
+    'перечисли факты',
+    'покажи факты',
+)
+FORGET_TRIGGERS = ('забудь', 'удали из памяти', 'сотри из памяти', 'выкинь из памяти')
+WEB_SEARCH_EXPLICIT_TRIGGERS = (
+    'найди в интернете',
+    'поищи в интернете',
+    'погугли мне',
+    'погугли',
+    'найди мне',
+    'поищи мне',
+    'найди',
+    'поищи',
+)
+WEB_SEARCH_NEWS_KEYWORDS = (
+    'новости',
+    'новость',
+    'свежие новости',
+    'последние новости',
+    'что нового',
+)
+WEB_SEARCH_FACT_TRIGGERS = (
+    'что такое',
+    'кто такой',
+    'кто такая',
+    'кто такие',
+    'когда выходит',
+    'когда вышел',
+    'когда вышла',
+)
+WEB_SEARCH_WEATHER_TRIGGERS = (
+    'какая погода',
+    'какая сейчас погода',
+    'погода в',
+    'погода на',
+)
+TYPE_CHECK_TRIGGERS = (
+    'проверь типы',
+    'проверь типизацию',
+    'проверь файл',
+    'проверь код',
+    'mypy',
+    'типы в',
+)
+LINT_TRIGGERS = (
+    'линтуй',
+    'линт',
+    'ruff',
+    'проверь стиль',
+    'проверь линтером',
+)
+CODE_TARGET_PREPOSITIONS = ('в файле ', 'в модуле ', 'файл ', 'файла ', 'на файл ', 'на ', 'в ', 'для ')
+
+SITE_ALIASES: dict[str, str] = {
+    'ютуб': 'https://www.youtube.com',
+    'youtube': 'https://www.youtube.com',
+    'гугл': 'https://www.google.com',
+    'google': 'https://www.google.com',
+    'яндекс': 'https://www.yandex.ru',
+    'yandex': 'https://www.yandex.ru',
+    'вконтакте': 'https://vk.com',
+    'вк': 'https://vk.com',
+    'vk': 'https://vk.com',
+    'гитхаб': 'https://github.com',
+    'github': 'https://github.com',
+    'телеграм': 'https://web.telegram.org',
+    'telegram': 'https://web.telegram.org',
+    'твиттер': 'https://twitter.com',
+    'twitter': 'https://twitter.com',
+    'почту': 'https://mail.google.com',
+    'почта': 'https://mail.google.com',
+    'gmail': 'https://mail.google.com',
+    'reddit': 'https://www.reddit.com',
+    'реддит': 'https://www.reddit.com',
+    'stackoverflow': 'https://stackoverflow.com',
+    'wikipedia': 'https://www.wikipedia.org',
+    'вики': 'https://ru.wikipedia.org',
+    'википедию': 'https://ru.wikipedia.org',
+}
 VAGUE_NAME_PATTERNS = (
     'как нибудь',
     'как-нибудь',
@@ -52,35 +140,57 @@ VAGUE_NAME_PATTERNS = (
 )
 
 
-@dataclass(slots=True)
-class SystemActionResult:
-    action_name: str
-    message: str
-    executed: bool
+SystemActionResult = ToolResult
 
 
 class SystemActionRunner:
-    def __init__(self, config: SystemActionsConfig, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        config: SystemActionsConfig,
+        logger: logging.Logger | None = None,
+        *,
+        extra_tools: list[CallableTool] | None = None,
+    ) -> None:
         self.config = config
         self.logger = logger or logging.getLogger(__name__)
         self.root_dir = _resolve_managed_root(config.document_dir)
         self.registry_path = _resolve_registry_path(config.registry_path)
+        self._extra_tools: list[CallableTool] = list(extra_tools or [])
+        self.tools = self._build_tool_registry()
 
     def handle(self, user_text: str) -> SystemActionResult | None:
         normalized = _normalize(user_text)
         if not normalized:
             return None
 
-        if _is_destructive_request(normalized):
+        blocked_result = self.block_if_unsafe(user_text)
+        if blocked_result is not None:
+            return blocked_result
+
+        tool_call = self._detect_tool_call(user_text, normalized)
+        if tool_call is None:
+            return None
+
+        return self.execute_tool_call(tool_call)
+
+    def block_if_unsafe(self, user_text: str) -> SystemActionResult | None:
+        normalized = _normalize(user_text)
+        if not normalized or not _is_destructive_request(normalized):
+            return None
+
+        return SystemActionResult(
+            action_name='blocked_destructive_request',
+            message='Нет. Удалять, перезаписывать, перемещать, очищать или форматировать файлы мне запрещено.',
+            executed=False,
+        )
+
+    def execute_tool_call(self, tool_call: ToolCall) -> SystemActionResult:
+        if tool_call.name not in {spec.name for spec in self.tool_specs()}:
             return SystemActionResult(
-                action_name='blocked_destructive_request',
-                message='Нет. Удалять, перезаписывать, перемещать, очищать или форматировать файлы мне запрещено.',
+                action_name='unknown_tool',
+                message=f"Неизвестный инструмент: {tool_call.name}",
                 executed=False,
             )
-
-        detected_action = self._detect_action(user_text, normalized)
-        if detected_action is None:
-            return None
 
         if not self.config.enabled:
             return SystemActionResult(
@@ -90,7 +200,7 @@ class SystemActionRunner:
             )
 
         try:
-            return detected_action()
+            return self.tools.run(tool_call)
         except Exception as exc:
             self.logger.warning("System action failed: %s", exc)
             return SystemActionResult(
@@ -99,36 +209,208 @@ class SystemActionRunner:
                 executed=False,
             )
 
-    def _detect_action(self, original_text: str, normalized: str):
+    def tool_specs(self) -> list[ToolSpec]:
+        return self.tools.specs
+
+    def _build_tool_registry(self) -> ToolRegistry:
+        return ToolRegistry(
+            [
+                CallableTool(
+                    ToolSpec(
+                        name='open_url',
+                        description='Open the default browser with a safe HTTP/HTTPS URL.',
+                        parameters=(
+                            ToolParameter('url', 'string', 'HTTP or HTTPS URL to open.'),
+                            ToolParameter('action_name', 'string', 'Result action name.', required=False),
+                        ),
+                    ),
+                    lambda call: self._open_url(
+                        str(call.arguments['url']),
+                        str(call.arguments.get('action_name') or 'open_browser'),
+                    ),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='search_web',
+                        description='Open the default browser with a Google search query.',
+                        parameters=(ToolParameter('query', 'string', 'Search query to open in the browser.'),),
+                    ),
+                    lambda call: self._open_url(
+                        f"https://www.google.com/search?q={quote_plus(str(call.arguments['query']))}",
+                        'open_search',
+                    ),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='open_vscode',
+                        description='Open VS Code through the configured command without shell access.',
+                    ),
+                    lambda _call: self._open_vscode(),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='create_folder',
+                        description=(
+                            'Create a folder inside the managed system-actions root. '
+                            'If the user asks you to choose a name, provide a short meaningful Russian folder_name.'
+                        ),
+                        parameters=(
+                            ToolParameter('folder_name', 'string', 'Folder name. Omit only if no name is needed.', required=False),
+                        ),
+                    ),
+                    lambda call: self._create_folder_fields(_optional_str(call.arguments.get('folder_name'))),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='create_folder_with_document',
+                        description=(
+                            'Create a managed folder and a .txt document inside it. '
+                            'Use this when the user asks for a folder plus a note/document/file in the same request.'
+                        ),
+                        parameters=(
+                            ToolParameter('folder_name', 'string', 'Folder name. Choose a meaningful name if the user asks you to decide.', required=False),
+                            ToolParameter('document_title', 'string', 'Text document title without path. Choose a useful title if needed.', required=False),
+                            ToolParameter('content', 'string', 'Initial document text.', required=False),
+                        ),
+                    ),
+                    lambda call: self._create_folder_with_document_fields(
+                        _optional_str(call.arguments.get('folder_name')),
+                        _optional_str(call.arguments.get('document_title')),
+                        _optional_str(call.arguments.get('content')) or '',
+                    ),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='create_text_document',
+                        description='Create a new .txt document in the managed folder without overwriting existing files.',
+                        parameters=(
+                            ToolParameter('document_title', 'string', 'Text document title without path. Choose a useful title if needed.', required=False),
+                            ToolParameter('content', 'string', 'Initial document text.', required=False),
+                            ToolParameter('folder_name', 'string', 'Existing or new managed folder name for the document.', required=False),
+                        ),
+                    ),
+                    lambda call: self._create_text_document_fields(
+                        _optional_str(call.arguments.get('document_title')),
+                        _optional_str(call.arguments.get('content')) or '',
+                        _optional_str(call.arguments.get('folder_name')),
+                    ),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='append_text_document',
+                        description='Append text to a managed .txt document, creating it if needed.',
+                        parameters=(
+                            ToolParameter('content', 'string', 'Text to append.'),
+                            ToolParameter('document_title', 'string', 'Target .txt document title without path.', required=False),
+                            ToolParameter('folder_name', 'string', 'Managed folder name containing the document.', required=False),
+                        ),
+                    ),
+                    lambda call: self._append_text_document_fields(
+                        _optional_str(call.arguments.get('document_title')),
+                        _optional_str(call.arguments.get('content')) or '',
+                        _optional_str(call.arguments.get('folder_name')),
+                    ),
+                ),
+                CallableTool(
+                    ToolSpec(
+                        name='rename_created_item',
+                        description=(
+                            'Rename only files or folders previously created by Herta and recorded in the registry. '
+                            "Use kind='folder' for folders and kind='file' for text documents."
+                        ),
+                        parameters=(
+                            ToolParameter('kind', 'string', "Either 'folder' or 'file'."),
+                            ToolParameter('old_name', 'string', 'Current item name without path.'),
+                            ToolParameter('new_name', 'string', 'New item name without path. Choose a meaningful name if the user asks you to decide.', required=False),
+                        ),
+                    ),
+                    lambda call: self._rename_created_item_fields(
+                        str(call.arguments['kind']),
+                        str(call.arguments['old_name']),
+                        _optional_str(call.arguments.get('new_name')),
+                    ),
+                ),
+                *self._extra_tools,
+            ]
+        )
+
+    def _detect_tool_call(self, original_text: str, normalized: str) -> ToolCall | None:
+        memory_call = _detect_memory_call(original_text, normalized)
+        if memory_call is not None:
+            return memory_call
+
+        code_call = _detect_code_check_call(original_text, normalized)
+        if code_call is not None:
+            return code_call
+
+        search_call = _detect_web_search_call(original_text, normalized)
+        if search_call is not None:
+            return search_call
+
         if _has_any(normalized, OPEN_WORDS):
             url = _extract_url(original_text)
             if url is not None:
-                return lambda: self._open_url(url)
+                return ToolCall('open_url', {'url': url})
 
             if 'браузер' in normalized:
-                return lambda: self._open_url(self.config.browser_home_url)
+                return ToolCall('open_url', {'url': self.config.browser_home_url})
 
             if _mentions_vscode(normalized):
-                return self._open_vscode
+                return ToolCall('open_vscode')
+
+            shortcut_url = _site_alias_url(normalized)
+            if shortcut_url is not None:
+                return ToolCall('open_url', {'url': shortcut_url})
+
+            search_target = _strip_leading_trigger(original_text, normalized, OPEN_WORDS)
+            if search_target:
+                cleaned = search_target.strip(' ,.;:!?\'"`').strip()
+                if cleaned and not _mentions_folder(normalized) and not _mentions_text_document(normalized):
+                    return ToolCall('search_web', {'query': cleaned})
 
         search_query = _extract_search_query(original_text, normalized)
         if search_query is not None:
-            return lambda: self._open_url(f'https://www.google.com/search?q={quote_plus(search_query)}', 'open_search')
+            return ToolCall('search_web', {'query': search_query})
 
         if _has_any(normalized, RENAME_WORDS) and (_mentions_text_document(normalized) or _mentions_folder(normalized)):
-            return lambda: self._rename_created_item(original_text)
+            parsed = _extract_rename_request(original_text)
+            if parsed is None:
+                return ToolCall('rename_created_item', {'kind': 'file', 'old_name': '', 'new_name': ''})
+            kind, old_name, new_name = parsed
+            return ToolCall('rename_created_item', {'kind': kind, 'old_name': old_name, 'new_name': new_name})
 
         if _has_any(normalized, WRITE_WORDS) and (_mentions_text_document(normalized) or _mentions_folder(normalized)):
-            return lambda: self._append_text_document(original_text)
+            return ToolCall(
+                'append_text_document',
+                {
+                    'document_title': _extract_write_document_title(original_text) or _extract_document_title(original_text),
+                    'content': _extract_write_document_content(original_text) or _extract_document_content(original_text),
+                    'folder_name': _extract_folder_name(original_text),
+                },
+            )
 
         if _has_any(normalized, CREATE_WORDS) and _mentions_folder(normalized) and _mentions_text_document(normalized):
-            return lambda: self._create_folder_with_document(original_text)
+            return ToolCall(
+                'create_folder_with_document',
+                {
+                    'folder_name': _extract_folder_name(original_text),
+                    'document_title': _extract_document_title(original_text),
+                    'content': _extract_document_content(original_text),
+                },
+            )
 
         if _has_any(normalized, CREATE_WORDS) and _mentions_folder(normalized):
-            return lambda: self._create_folder(original_text)
+            return ToolCall('create_folder', {'folder_name': _extract_folder_name(original_text)})
 
         if _has_any(normalized, CREATE_WORDS) and _mentions_text_document(normalized):
-            return lambda: self._create_text_document(original_text)
+            return ToolCall(
+                'create_text_document',
+                {
+                    'document_title': _extract_document_title(original_text),
+                    'content': _extract_document_content(original_text),
+                    'folder_name': _extract_folder_name(original_text),
+                },
+            )
 
         return None
 
@@ -160,10 +442,9 @@ class SystemActionRunner:
             executed=True,
         )
 
-    def _create_folder(self, user_text: str) -> SystemActionResult:
+    def _create_folder_fields(self, folder_name: str | None) -> SystemActionResult:
         self.root_dir.mkdir(parents=True, exist_ok=True)
-        folder_name = _extract_folder_name(user_text) or _generated_folder_name()
-        target_path = _safe_folder_path(self.root_dir, folder_name)
+        target_path = _safe_folder_path(self.root_dir, folder_name or _generated_folder_name())
 
         existing = target_path.exists()
         if existing and not self._is_registered(target_path, 'folder'):
@@ -179,24 +460,50 @@ class SystemActionRunner:
             action_name='create_folder',
             message=f"{'Папка уже была создана' if existing else 'Создана папка'}: {target_path}",
             executed=not existing,
+            data={'path': str(target_path), 'name': target_path.name},
+        )
+
+    def _create_folder(self, user_text: str) -> SystemActionResult:
+        return self._create_folder_fields(_extract_folder_name(user_text))
+
+    def _create_folder_with_document_fields(
+        self,
+        folder_name: str | None,
+        document_title: str | None,
+        content: str,
+    ) -> SystemActionResult:
+        folder_result = self._create_folder_fields(folder_name)
+        folder_path_raw = folder_result.data.get('path')
+        if not folder_path_raw:
+            return folder_result
+
+        return self._create_text_document_fields(
+            document_title,
+            content,
+            folder_name=None,
+            parent_dir=Path(str(folder_path_raw)),
         )
 
     def _create_folder_with_document(self, user_text: str) -> SystemActionResult:
         folder_result = self._create_folder(user_text)
-        if not folder_result.executed and 'уже была создана' not in folder_result.message:
+        folder_path_raw = folder_result.data.get('path')
+        if not folder_path_raw:
             return folder_result
 
-        folder_name = _extract_folder_name(user_text)
-        folder_path = self._resolve_registered_folder(folder_name)
-        return self._create_text_document(user_text, parent_dir=folder_path)
+        return self._create_text_document(user_text, parent_dir=Path(str(folder_path_raw)))
 
-    def _create_text_document(self, user_text: str, parent_dir: Path | None = None) -> SystemActionResult:
-        documents_dir = parent_dir or self._resolve_target_folder(user_text)
+    def _create_text_document_fields(
+        self,
+        document_title: str | None,
+        content: str,
+        folder_name: str | None = None,
+        parent_dir: Path | None = None,
+    ) -> SystemActionResult:
+        documents_dir = parent_dir or self._resolve_registered_folder(folder_name)
         documents_dir.mkdir(parents=True, exist_ok=True)
 
-        title = _extract_document_title(user_text) or _generated_document_name()
+        title = document_title or _generated_document_name()
         filename = _text_filename(title)
-        content = _extract_document_content(user_text)
 
         target_path = _unique_child_path(documents_dir, filename)
         with target_path.open('x', encoding='utf-8') as file:
@@ -210,16 +517,29 @@ class SystemActionRunner:
             action_name='create_text_document',
             message=f'Создан текстовый документ: {target_path}',
             executed=True,
+            data={'path': str(target_path), 'name': target_path.name},
         )
 
-    def _append_text_document(self, user_text: str) -> SystemActionResult:
-        documents_dir = self._resolve_target_folder(user_text)
+    def _create_text_document(self, user_text: str, parent_dir: Path | None = None) -> SystemActionResult:
+        return self._create_text_document_fields(
+            _extract_document_title(user_text),
+            _extract_document_content(user_text),
+            _extract_folder_name(user_text),
+            parent_dir=parent_dir,
+        )
+
+    def _append_text_document_fields(
+        self,
+        document_title: str | None,
+        content: str,
+        folder_name: str | None = None,
+    ) -> SystemActionResult:
+        documents_dir = self._resolve_registered_folder(folder_name)
         documents_dir.mkdir(parents=True, exist_ok=True)
 
-        title = _extract_write_document_title(user_text) or _extract_document_title(user_text) or 'herta_note'
+        title = document_title or 'herta_note'
         filename = _text_filename(title)
         target_path = _safe_text_path(documents_dir, filename)
-        content = _extract_write_document_content(user_text) or _extract_document_content(user_text)
         if not content:
             return SystemActionResult(
                 action_name='append_text_document',
@@ -247,6 +567,69 @@ class SystemActionRunner:
             action_name='append_text_document',
             message=f"{'Создан и заполнен' if created else 'Записано в'} текстовый документ: {target_path}",
             executed=True,
+            data={'path': str(target_path), 'name': target_path.name, 'created': created},
+        )
+
+    def _append_text_document(self, user_text: str) -> SystemActionResult:
+        return self._append_text_document_fields(
+            _extract_write_document_title(user_text) or _extract_document_title(user_text),
+            _extract_write_document_content(user_text) or _extract_document_content(user_text),
+            _extract_folder_name(user_text),
+        )
+
+    def _rename_created_item_fields(
+        self,
+        kind: str,
+        old_name: str,
+        new_name: str | None,
+    ) -> SystemActionResult:
+        normalized_kind = kind.strip().lower()
+        if normalized_kind not in {'folder', 'file'}:
+            return SystemActionResult(
+                action_name='rename_created_item',
+                message="Тип для переименования должен быть 'folder' или 'file'.",
+                executed=False,
+            )
+
+        meaningful_old_name = _meaningful_name_or_none(old_name)
+        if meaningful_old_name is None:
+            return SystemActionResult(
+                action_name='rename_created_item',
+                message='Не поняла, что именно переименовать.',
+                executed=False,
+            )
+
+        meaningful_new_name = _meaningful_name_or_none(new_name or '')
+        if meaningful_new_name is None:
+            meaningful_new_name = _generated_folder_name() if normalized_kind == 'folder' else _generated_document_name()
+
+        old_path = self._find_registered_by_name(meaningful_old_name, normalized_kind)
+        if old_path is None:
+            return SystemActionResult(
+                action_name='rename_created_item',
+                message='Я могу переименовывать только файлы и папки, которые создала сама.',
+                executed=False,
+            )
+
+        new_path = (
+            _safe_folder_path(old_path.parent, meaningful_new_name)
+            if normalized_kind == 'folder'
+            else _safe_text_path(old_path.parent, _text_filename(meaningful_new_name))
+        )
+        if new_path.exists():
+            return SystemActionResult(
+                action_name='rename_created_item',
+                message=f'Новое имя уже занято, поэтому не переименовываю: {new_path}',
+                executed=False,
+            )
+
+        old_path.rename(new_path)
+        self._replace_registered_path(old_path, new_path, normalized_kind)
+        return SystemActionResult(
+            action_name='rename_created_item',
+            message=f'Переименовано: {old_path.name} -> {new_path.name}',
+            executed=True,
+            data={'old_path': str(old_path), 'path': str(new_path), 'name': new_path.name},
         )
 
     def _rename_created_item(self, user_text: str) -> SystemActionResult:
@@ -259,29 +642,7 @@ class SystemActionRunner:
             )
 
         kind, old_name, new_name = parsed
-        old_path = self._find_registered_by_name(old_name, kind)
-        if old_path is None:
-            return SystemActionResult(
-                action_name='rename_created_item',
-                message='Я могу переименовывать только файлы и папки, которые создала сама.',
-                executed=False,
-            )
-
-        new_path = _safe_folder_path(old_path.parent, new_name) if kind == 'folder' else _safe_text_path(old_path.parent, _text_filename(new_name))
-        if new_path.exists():
-            return SystemActionResult(
-                action_name='rename_created_item',
-                message=f'Новое имя уже занято, поэтому не переименовываю: {new_path}',
-                executed=False,
-            )
-
-        old_path.rename(new_path)
-        self._replace_registered_path(old_path, new_path, kind)
-        return SystemActionResult(
-            action_name='rename_created_item',
-            message=f'Переименовано: {old_path.name} -> {new_path.name}',
-            executed=True,
-        )
+        return self._rename_created_item_fields(kind, old_name, new_name)
 
     def _resolve_target_folder(self, user_text: str) -> Path:
         folder_name = _extract_folder_name(user_text)
@@ -378,18 +739,34 @@ class SystemActionRunner:
         return matches[0] if matches else None
 
 
-def build_system_actions_instruction() -> str:
-    return (
+def build_system_actions_instruction(*, structured_tools_available: bool = True) -> str:
+    base = (
         'The local assistant has a limited safe OS action runner. It can open the default browser, open HTTP/HTTPS URLs, '
-        'open VS Code, create folders, create new .txt files, append text to .txt files, and rename only files/folders '
+        'open web searches, open VS Code, create folders, create new .txt files, append text to .txt files, and rename only files/folders '
         'that it created itself. It cannot delete, move, overwrite files, format drives, or run arbitrary shell commands. '
-        'For supported OS action requests, answer briefly as if the action will be handled locally. For destructive '
-        'requests, refuse briefly.'
+        'For destructive requests, refuse briefly.'
+    )
+    if structured_tools_available:
+        return base + (
+            ' When structured tools are available, use them for supported OS action requests instead of only promising the action. '
+            'Never write tool-call JSON inline in your reply; that is not how tools are invoked here.'
+        )
+    return base + (
+        ' Structured tool calling is NOT available in this session. Do NOT output tool-call JSON, function-call wrappers, '
+        'or pseudo-XML. The user\'s Russian phrasing ("открой ютуб", "создай папку Х", "запомни Y", "проверь типы в Z") is '
+        'parsed locally and executed automatically. Just answer in character; the parser handles the action.'
     )
 
 
 def _normalize(text: str) -> str:
     return ' '.join(text.strip().lower().split())
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    return stripped or None
 
 
 def _has_any(text: str, words: tuple[str, ...]) -> bool:
@@ -404,12 +781,35 @@ def _mentions_vscode(normalized: str) -> bool:
     return 'vscode' in normalized or 'vs code' in normalized or 'visual studio code' in normalized
 
 
+TEXT_DOCUMENT_RE = re.compile(
+    r'\b(?:'
+    r'текстовый\s+документ'
+    r'|документ(?:а|у|ом|е|ах|ам|ы|ов|и)?'
+    r'|файл(?:а|у|ом|е|ах|ам|ы|ов|ик)?'
+    r'|txt'
+    r'|заметок'
+    r'|заметк(?:а|у|и|е|ах|ам|ами|ой|ою)?'
+    r')\b',
+    re.IGNORECASE | re.UNICODE,
+)
+
+FOLDER_RE = re.compile(
+    r'\b(?:'
+    r'папок'
+    r'|папк(?:а|у|е|и|ой|ою|ам|ах|ами)?'
+    r'|каталог(?:а|у|ом|е|ов|и|ах|ам)?'
+    r'|директори(?:я|ю|и|ей|ях|ям|ями)?'
+    r')\b',
+    re.IGNORECASE | re.UNICODE,
+)
+
+
 def _mentions_text_document(normalized: str) -> bool:
-    return any(word in normalized for word in ('текстовый документ', 'документ', 'файл', 'txt', 'заметк'))
+    return TEXT_DOCUMENT_RE.search(normalized) is not None
 
 
 def _mentions_folder(normalized: str) -> bool:
-    return any(word in normalized for word in ('папк', 'каталог', 'директор'))
+    return FOLDER_RE.search(normalized) is not None
 
 
 def _extract_url(text: str) -> str | None:
@@ -692,3 +1092,155 @@ def _resolve_vscode_command(command: str) -> str | None:
             return found
 
     return shutil.which('code') or shutil.which('code.cmd')
+
+
+def _detect_memory_call(original_text: str, normalized: str) -> ToolCall | None:
+    if _has_any(normalized, RECALL_TRIGGERS):
+        return ToolCall('recall', {})
+
+    forget_payload = _strip_leading_trigger(original_text, normalized, FORGET_TRIGGERS)
+    if forget_payload is not None:
+        cleaned = _strip_memory_modifiers(forget_payload).strip(' ,.;:!?-"\'')
+        if cleaned:
+            return ToolCall('forget', {'content_match': cleaned})
+        return ToolCall('forget', {'content_match': ''})
+
+    remember_payload = _strip_leading_trigger(original_text, normalized, REMEMBER_TRIGGERS)
+    if remember_payload is not None:
+        cleaned = _strip_memory_modifiers(remember_payload).strip(' ,.;:!?-"\'')
+        if cleaned:
+            return ToolCall(
+                'remember',
+                {'content': cleaned, 'category': _guess_memory_category(cleaned)},
+            )
+
+    return None
+
+
+def _strip_leading_trigger(original_text: str, normalized: str, triggers: tuple[str, ...]) -> str | None:
+    if not _has_any(normalized, triggers):
+        return None
+    for trigger in sorted(triggers, key=len, reverse=True):
+        pattern = re.compile(r'\b' + re.escape(trigger) + r'\b', re.IGNORECASE)
+        match = pattern.search(original_text)
+        if match is not None:
+            return original_text[match.end():].lstrip()
+    return ''
+
+
+def _strip_memory_modifiers(text: str) -> str:
+    lowered = text.lower().strip()
+    for prefix in (
+        'что ',
+        'про то что ',
+        'про то, что ',
+        'о том что ',
+        'о том, что ',
+        ', что ',
+        ': ',
+        '- ',
+    ):
+        if lowered.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
+
+
+def _detect_web_search_call(original_text: str, normalized: str) -> ToolCall | None:
+    # Реплика, которая явно про локальные файлы или папки — не наш кейс.
+    has_filesystem_context = _mentions_text_document(normalized) or _mentions_folder(normalized)
+
+    explicit_payload = _strip_leading_trigger(original_text, normalized, WEB_SEARCH_EXPLICIT_TRIGGERS)
+    if explicit_payload is not None and not has_filesystem_context:
+        cleaned = explicit_payload.strip(' ,.;:!?\'"`').strip()
+        if cleaned:
+            return ToolCall('web_search', {'query': cleaned})
+
+    weather_query = _build_search_query(original_text, normalized, WEB_SEARCH_WEATHER_TRIGGERS, prefix='погода')
+    if weather_query is not None:
+        return ToolCall('web_search', {'query': weather_query})
+
+    if _has_any(normalized, WEB_SEARCH_NEWS_KEYWORDS) and not has_filesystem_context:
+        query = original_text.strip(' ,.;:!?\'"`').strip()
+        if query:
+            return ToolCall('web_search', {'query': query})
+
+    if _has_any(normalized, WEB_SEARCH_FACT_TRIGGERS):
+        cleaned = original_text.strip(' ,.;:!?\'"`').strip()
+        if cleaned:
+            return ToolCall('web_search', {'query': cleaned})
+
+    return None
+
+
+def _build_search_query(
+    original_text: str,
+    normalized: str,
+    triggers: tuple[str, ...],
+    *,
+    prefix: str | None,
+) -> str | None:
+    payload = _strip_leading_trigger(original_text, normalized, triggers)
+    if payload is None:
+        return None
+
+    cleaned = payload.strip(' ,.;:!?\'"`').strip()
+    if not cleaned:
+        # 'какая погода' без уточнения локации - оставляем как есть, поиск выдаст по геолокации
+        return prefix
+    if prefix and prefix not in cleaned.lower():
+        return f'{prefix} {cleaned}'
+    return cleaned
+
+
+def _site_alias_url(normalized: str) -> str | None:
+    tokens = re.findall(r'[\w-]+', normalized, flags=re.UNICODE)
+    for token in tokens:
+        url = SITE_ALIASES.get(token.lower())
+        if url is not None:
+            return url
+    return None
+
+
+def _detect_code_check_call(original_text: str, normalized: str) -> ToolCall | None:
+    if _has_any(normalized, LINT_TRIGGERS):
+        target = _extract_code_target(original_text, normalized, LINT_TRIGGERS)
+        if target:
+            return ToolCall('lint_code', {'target': target})
+
+    if _has_any(normalized, TYPE_CHECK_TRIGGERS):
+        target = _extract_code_target(original_text, normalized, TYPE_CHECK_TRIGGERS)
+        if target:
+            return ToolCall('type_check', {'target': target})
+
+    return None
+
+
+def _extract_code_target(original_text: str, normalized: str, triggers: tuple[str, ...]) -> str | None:
+    payload = _strip_leading_trigger(original_text, normalized, triggers)
+    if payload is None:
+        return None
+
+    cleaned = payload.strip(' ,.;:!?\'"`')
+    if not cleaned:
+        return None
+
+    lowered = cleaned.lower()
+    for preposition in CODE_TARGET_PREPOSITIONS:
+        if lowered.startswith(preposition):
+            cleaned = cleaned[len(preposition):].strip()
+            break
+
+    candidate = cleaned.split()[0] if cleaned else ''
+    candidate = candidate.strip(' ,.;:!?\'"`')
+    return candidate or None
+
+
+def _guess_memory_category(content: str) -> str:
+    lowered = content.lower()
+    if any(marker in lowered for marker in ('меня зовут', 'мне ', 'я живу', 'я работаю', 'мой возраст', 'я родил', 'я учу')):
+        return 'user'
+    if any(marker in lowered for marker in ('проект', 'репозитор', 'кодовая база', 'модуль', 'фича', 'релиз')):
+        return 'project'
+    if any(marker in lowered for marker in ('предпочит', 'люблю', 'не люблю', 'стиль', 'привычка', 'формат')):
+        return 'preferences'
+    return 'notes'

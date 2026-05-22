@@ -23,11 +23,13 @@ htmlcov/
 # Local environment files
 .env
 .env.*
+!.env.example
 
 # IDE and editor files
 .vscode/
 .idea/
 *.code-workspace
+.claude/
 
 # OS files
 .DS_Store

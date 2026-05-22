@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import logging
 from typing import Any, Callable
 
+from actions.tool_layer import ToolCall, ToolResult, ToolSpec, build_function_declarations
 from audio.live import LIVE_INPUT_SAMPLE_RATE, LiveAudioOutput, LiveMicrophoneInput
 from brain.memory import DialogueMemory
 from config import AudioInputConfig, AudioOutputConfig, GoogleAIConfig
@@ -43,7 +44,7 @@ class GoogleLiveVoiceClient:
             return 'v1alpha'
         return self.config.live_api_version
 
-    def _build_live_config(self) -> dict[str, Any]:
+    def _build_live_config(self, tool_specs: list[ToolSpec] | None = None) -> dict[str, Any]:
         live_config: dict[str, Any] = {
             'response_modalities': ['AUDIO'],
         }
@@ -71,6 +72,8 @@ class GoogleLiveVoiceClient:
             live_config['proactivity'] = {'proactive_audio': True}
         if self._uses_gemini_3_live():
             live_config['history_config'] = {'initial_history_in_client_content': True}
+        if tool_specs:
+            live_config['tools'] = [{'function_declarations': build_function_declarations(tool_specs)}]
 
         return live_config
 
@@ -183,12 +186,49 @@ class GoogleLiveVoiceClient:
             except Exception as exc:
                 logger.warning("Live transcript TTS failed: %s", exc)
 
+    async def _handle_tool_call(
+        self,
+        response: Any,
+        session: Any,
+        types: Any,
+        execute_tool: Callable[[ToolCall], ToolResult] | None,
+    ) -> bool:
+        tool_call = getattr(response, 'tool_call', None)
+        if tool_call is None or execute_tool is None:
+            return False
+
+        function_responses = []
+        for function_call in getattr(tool_call, 'function_calls', None) or []:
+            name = str(getattr(function_call, 'name', '') or '').strip()
+            if not name:
+                continue
+            raw_args = getattr(function_call, 'args', None) or {}
+            args = dict(raw_args) if isinstance(raw_args, dict) else {}
+            result = execute_tool(ToolCall(name=name, arguments=args))
+            response_payload = {
+                'name': name,
+                'response': result.to_function_response(),
+            }
+            function_call_id = getattr(function_call, 'id', None)
+            if function_call_id:
+                response_payload['id'] = function_call_id
+            function_responses.append(types.FunctionResponse(**response_payload))
+            logger.info("Google Live structured tool handled: action=%s executed=%s.", result.action_name, result.executed)
+
+        if not function_responses:
+            return False
+
+        await session.send_tool_response(function_responses=function_responses)
+        return True
+
     async def _receive_model_audio(
         self,
         session: Any,
+        types: Any,
         output: LiveAudioOutput | None,
         memory_store: DialogueMemory | None,
         system_action_runner: Callable[[str], object | None] | None,
+        execute_tool: Callable[[ToolCall], ToolResult] | None,
         transcript_tts: Any | None,
     ) -> None:
         input_chunks: list[str] = []
@@ -199,6 +239,9 @@ class GoogleLiveVoiceClient:
 
         while True:
             async for response in session.receive():
+                if await self._handle_tool_call(response, session, types, execute_tool):
+                    continue
+
                 raw_audio = getattr(response, 'data', None)
                 wrote_response_audio = raw_audio is not None
                 if raw_audio is not None:
@@ -266,6 +309,8 @@ class GoogleLiveVoiceClient:
         audio_output_config: AudioOutputConfig,
         memory_store: DialogueMemory | None,
         system_action_runner: Callable[[str], object | None] | None = None,
+        tool_specs: list[ToolSpec] | None = None,
+        execute_tool: Callable[[ToolCall], ToolResult] | None = None,
         transcript_tts: Any | None = None,
     ) -> None:
         self._validate_api_key()
@@ -287,13 +332,21 @@ class GoogleLiveVoiceClient:
         with LiveMicrophoneInput(audio_config) as microphone, output_context as output:
             async with client.aio.live.connect(
                 model=self.config.live_model,
-                config=self._build_live_config(),
+                config=self._build_live_config(tool_specs),
             ) as session:
                 await self._seed_context(session, messages)
 
                 sender_task = asyncio.create_task(self._send_microphone_audio(session, microphone, types))
                 receiver_task = asyncio.create_task(
-                    self._receive_model_audio(session, output, memory_store, system_action_runner, transcript_tts)
+                    self._receive_model_audio(
+                        session,
+                        types,
+                        output,
+                        memory_store,
+                        system_action_runner,
+                        execute_tool,
+                        transcript_tts,
+                    )
                 )
                 done, pending = await asyncio.wait(
                     {sender_task, receiver_task},

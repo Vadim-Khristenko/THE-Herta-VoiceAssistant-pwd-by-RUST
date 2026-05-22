@@ -1,6 +1,6 @@
 ﻿# The Herta Voice Assistant
 
-Альфа-версия локального голосового ассистента в образе Великой Герты из Honkai: Star Rail.
+Локальный голосовой ассистент в образе Великой Герты из Honkai: Star Rail. **Текущая версия: v0.3.**
 
 Текущий фокус:
 - локальный пайплайн без лишней инфраструктуры
@@ -8,40 +8,48 @@
 - голосовое общение с персонажной подачей
 - минимальная и понятная база для соло-разработки под Windows
 
-## Статус альфы
+## Статус v0.3
 
 Что уже работает:
-- текстовый чат через локальный Ollama, DeepSeek/OpenRouter или Google AI Studio
+- текстовый чат через локальный Ollama, Cerebras, DeepSeek/OpenRouter или Google AI Studio
 - голосовой режим: микрофон -> VAD -> STT -> LLM -> опциональный TTS
+- **wake-word активация по имени**: Герта отвечает только после обращения по имени («Герта», «Эй Герта», «Великая Герта»…), с follow-up окном для естественного диалога. Реализованы text-режим (поверх STT) и опциональный Porcupine
 - STT через локальный `faster-whisper` или через Google AI Studio
-- persona-слой для Великой Герты с более естественным разговорным режимом
-- локальная память последних диалогов между перезапусками
-- безопасные системные действия: открыть браузер/сайт/поиск, открыть VS Code, создать новый `.txt`
-- голосовое взаимодействие на русском языке
-- автоматическое определение языка Whisper для смешанного русского и английского ввода
-- опциональная озвучка ответов через Edge TTS
+- persona-слой для Великой Герты с более естественным разговорным режимом и персонажным голосом в коде/комментариях
+- **долговременная память**: факты о пользователе и проекте сохраняются между сессиями (`data/long_memory.json`), доступны команды «запомни X», «что ты обо мне помнишь», «забудь X». Auto-extract выделяет стабильные факты каждые N реплик
+- короткая память последних диалогов между перезапусками
+- безопасные системные действия: открыть браузер/сайт/поиск, открыть VS Code, создать папку, создать/дописать `.txt`. Запрещены удаление, перемещение, перезапись, форматирование, произвольный shell
+- **алиасы популярных сайтов** для «открой ютуб», «открой почту», «открой гитхаб» и других; неизвестные имена уходят в веб-поиск
+- **web search через Tavily**: «найди мне X», «новости про Y», «какая погода в Z», «что такое X», «когда выходит Y». Результаты пересказываются голосом Герты, противоречия в источниках отмечаются
+- **code tools**: голосовые команды «проверь типы в файле X» (mypy) и «линтуй X» (ruff). Опциональная самопроверка собственных Python-блоков с repair-циклом — Герта переписывает свой код, если mypy/ruff находят замечания
+- голосовое взаимодействие на русском языке, автоопределение языка Whisper для смешанного русского и английского
+- опциональная озвучка ответов через Edge TTS, RVC-голос Герты поверх Silero/Piper
 
 Что пока не реализовано:
-- активация по wake word
-- произвольный tool calling или выполнение shell-команд от имени ассистента
-- долгосрочная структурированная память профиля и фактов
+- vision (анализ скриншота через multimodal LLM)
+- streaming TTS (мгновенный отклик во время генерации)
+- произвольный tool calling или выполнение shell-команд
 - полноценная двуязычная стратегия диалога и автоматическое переключение TTS по языку
+- локальный RAG по проекту
 
-Иначе говоря: в текущей альфе ассистент умеет слушать, распознавать, думать, отвечать, при необходимости озвучивать ответ и выполнять небольшой набор безопасных системных действий. Полного доступа к системе у него нет.
+Иначе говоря: в v0.3 ассистент умеет слышать имя, помнить факты между сессиями, искать в интернете с пересказом, проверять Python-код через mypy/ruff и переписывать собственные ответы, выполнять безопасные системные действия. Полного доступа к системе у него по-прежнему нет.
 
 ## Стек
 
-- Python
+- Python 3.11+
 - Ollama
-- локальная LLM: `qwen3:4b` по умолчанию
-- опциональный облачный LLM-провайдер: DeepSeek API, OpenRouter или Google AI Studio
+- локальная LLM: `qwen3:4b` или `gemma4` по умолчанию
+- опциональные облачные LLM-провайдеры: Cerebras (gpt-oss-120b и др.), DeepSeek/OpenRouter, Google AI Studio
 - `sounddevice` для аудиоввода
 - `silero-vad` для сегментации речи
 - `faster-whisper` для распознавания речи
 - Google AI Studio для опционального облачного распознавания речи
 - `edge-tts`, SAPI/Piper или Silero для базового синтеза речи
 - Applio/RVC для опционального голоса Герты поверх базового TTS
-- безопасный allowlist-слой для системных действий без произвольной консоли
+- `mypy` + `ruff` для статической проверки Python-кода (опционально)
+- Tavily Web Search API для актуальных ответов из интернета (опционально)
+- Picovoice Porcupine для настоящего wake-word детектора (опционально)
+- безопасный tool layer для системных действий без произвольной консоли
 
 ## Структура проекта
 
@@ -80,6 +88,61 @@ The_Herta_Voice_Assistant/
 
 При этом характер не должен заменять пользу. Герта может быть язвительной, но после колкости должна дать рабочий технический ответ. Для Live-моделей используется компактный persona prompt, поэтому изменения личности применяются и в `--live-voice`.
 
+## Возможности v0.3 — голосовые команды
+
+Все триггеры ниже распознаются локально, до отправки в LLM. Работают на любом провайдере (Cerebras, Ollama, DeepSeek, Google AI), не требуют structured tool calling.
+
+### Wake word
+
+В режиме `--voice` Герта молчит, пока не услышит обращение по имени:
+
+- «Герта, открой ютуб»
+- «Эй Герта, какая погода»
+- «Великая Герта, что думаешь про этот код»
+
+После каждого ответа на `WAKEWORD_FOLLOW_UP_SECONDS` (60 секунд по умолчанию) Герта остаётся «активной» и слушает реплики без повторного обращения по имени.
+
+Триггеры можно расширять через `WAKEWORD_PHRASES`. По умолчанию включены частые ошибки Whisper («герто», «герда», «герту»), чтобы STT-неточности не ломали распознавание имени. Доступен и опциональный режим Porcupine для настоящего low-power детектора (`WAKEWORD_MODE=porcupine|both`, нужен `.ppn` файл).
+
+### Долговременная память
+
+Факты о пользователе и проекте сохраняются между сессиями в `data/long_memory.json` (категории: `user`, `project`, `preferences`, `notes`):
+
+- «Герта, запомни что меня зовут Влад» → сохраняет в категорию `user`
+- «Герта, запомни что я предпочитаю строгую типизацию» → сохраняет в `preferences`
+- «Герта, что ты обо мне помнишь» → перечисляет факты
+- «Герта, забудь что меня зовут Влад» → удаляет совпадения
+
+Если включён `LONG_MEMORY_AUTO_EXTRACT=true`, каждые `LONG_MEMORY_AUTO_EXTRACT_EVERY_TURNS` реплик Герта делает дополнительный LLM-вызов и сама извлекает стабильные факты из диалога, помечая их `source: auto`. При старте сессии все факты подмешиваются в системный промпт — Герта помнит контекст без явных подсказок.
+
+### Web search (Tavily)
+
+Триггеры для актуальной информации из интернета:
+
+- «Найди мне новости про Anthropic», «Поищи рецепт борща», «Погугли курс биткоина»
+- «Какая погода в Москве», «Какая сейчас погода»
+- «Что такое квантовая запутанность», «Кто такой Линус Торвальдс», «Когда выходит GTA 6»
+- «Свежие новости по AI», «Новости от OpenAI»
+
+Под капотом: Tavily Search API → результаты (краткий ответ + 5 источников) → второй LLM-вызов на пересказ в голосе Герты. Если источники противоречат друг другу, Герта это явно отмечает.
+
+Чтобы отключить followup и зачитывать сырой ответ Tavily (быстрее, но безлично), поставь `WEB_SEARCH_FOLLOWUP_IN_CHARACTER=false`.
+
+### Code tools (mypy + ruff)
+
+- «Проверь типы в файле main.py» → запускает `mypy main.py`
+- «Линтуй actions/code_tools.py» → запускает `ruff check`
+
+Проверки read-only, никакие файлы не модифицируются.
+
+Опциональная **самопроверка** (`CODE_TOOLS_SELF_CHECK=true`): когда Герта присылает Python-блок в ответе, фрагмент автоматически прогоняется через mypy + ruff. Если есть замечания, делается repair-вызов LLM, и Герта переписывает свой ответ с учётом фидбэка. Цена — один дополнительный LLM-запрос на ответ с кодом.
+
+Persona-слой настроен на modern Python: `list[T]` вместо `List`, `T | None` вместо `Optional`, `collections.abc` вместо `typing` для протоколов. Самопроверка через ruff (`UP`-rules) подтягивает реальный синтаксис, если модель забыла.
+
+### Сайты по короткому имени
+
+«Открой ютуб», «Открой почту», «Открой гитхаб», «Открой википедию» — открывают конкретные сайты по словарю алиасов. Поддерживаются: youtube, google, yandex, vk, github, telegram, twitter, gmail, reddit, stackoverflow, wikipedia. Для неизвестных имён («Открой документацию по pandas») делается веб-поиск через браузер.
+
 ## Требования
 
 - Windows
@@ -87,8 +150,14 @@ The_Herta_Voice_Assistant/
 - локально установленный Ollama
 - запущенный Ollama-сервер на `http://127.0.0.1:11434`
 - хотя бы одна загруженная модель в Ollama
+- опционально: Cerebras API key, если используешь `LLM_PROVIDER='cerebras'` (быстрейший облачный путь, https://cloud.cerebras.ai/)
 - опционально: DeepSeek/OpenRouter API key, если используешь `LLM_PROVIDER='deepseek'`
 - опционально: Google AI Studio API key, если используешь `LLM_PROVIDER='google_ai'`
+- опционально: Tavily API key для web search (`WEB_SEARCH_ENABLED='true'`, https://tavily.com/)
+- опционально: Picovoice Porcupine access key и `.ppn` для wake-word режима `porcupine`/`both`
+- опционально: `mypy` + `ruff` в `pip` для code-tools и самопроверки кода
+
+Удобнее всего держать настройки в файле `.env` в корне проекта (он в `.gitignore` и не коммитится). Минимальный шаблон лежит в [`.env.example`](.env.example) — скопируй его в `.env` и подставь свои значения.
 
 Рекомендуемая модель:
 
@@ -465,7 +534,7 @@ python main.py --live-voice
 
 ### Безопасные системные действия
 
-Системные действия выключены по умолчанию. Чтобы Герта могла открывать браузер, VS Code, создавать папки и работать с текстовыми документами, включи allowlist:
+Системные действия выключены по умолчанию. Чтобы Герта могла открывать браузер, VS Code, создавать папки и работать с текстовыми документами, включи tool layer:
 
 ```powershell
 $env:SYSTEM_ACTIONS_ENABLED='true'
@@ -502,6 +571,16 @@ $env:SYSTEM_ACTIONS_VSCODE_OPEN_WORKSPACE='true'
 Текстовые документы и папки создаются только внутри `SYSTEM_ACTIONS_DOCUMENT_DIR`. Значение `desktop` означает рабочий стол Windows. Если пользователь просит назвать объект "как-нибудь", Герта сама генерирует имя вместо буквального `как-нибудь`.
 
 Файлы можно только дописывать в конец `.txt`. Переименование разрешено только для файлов и папок, которые сама Герта создала и записала в `SYSTEM_ACTIONS_REGISTRY_PATH`. Чужие файлы на рабочем столе она не переименовывает и не меняет.
+
+Внутри это устроено как структурированный tool layer:
+- Gemini `--voice` и `--live-voice` получают `functionDeclarations` и возвращают структурированный `functionCall`;
+- код выполняет только зарегистрированный `ToolCall` и отправляет результат обратно как `functionResponse`;
+- для Ollama/DeepSeek остается локальный русский parser-fallback;
+- `ToolRegistry` выбирает зарегистрированный инструмент по имени;
+- инструмент возвращает единый `ToolResult`;
+- destructive tools не регистрируются и не выполняются.
+
+Сейчас зарегистрированы tools: `open_url`, `search_web`, `open_vscode`, `create_folder`, `create_folder_with_document`, `create_text_document`, `append_text_document`, `rename_created_item`.
 
 ### Опционально: RVC-голос Герты
 
@@ -745,6 +824,47 @@ $env:SYSTEM_ACTIONS_REGISTRY_PATH='data/system_actions_registry.json'
 $env:SYSTEM_ACTIONS_BROWSER_HOME_URL='https://www.google.com'
 $env:SYSTEM_ACTIONS_VSCODE_COMMAND='code'
 $env:SYSTEM_ACTIONS_VSCODE_OPEN_WORKSPACE='true'
+
+# v0.3 — Cerebras provider
+$env:LLM_PROVIDER='cerebras'
+$env:CEREBRAS_API_KEY='csk-...'
+$env:CEREBRAS_MODEL='gpt-oss-120b'
+$env:CEREBRAS_MAX_TOKENS='700'
+$env:CEREBRAS_TIMEOUT_SECONDS='60'
+
+# v0.3 — Wake word
+$env:WAKEWORD_ENABLED='true'
+$env:WAKEWORD_MODE='text'
+$env:WAKEWORD_PHRASES='герта,герто,великая герта,эй герта,herta'
+$env:WAKEWORD_FOLLOW_UP_SECONDS='60'
+# опциональный Porcupine:
+$env:PORCUPINE_ACCESS_KEY=''
+$env:PORCUPINE_KEYWORD_PATHS=''
+$env:PORCUPINE_SENSITIVITY='0.5'
+
+# v0.3 — Долговременная память
+$env:LONG_MEMORY_ENABLED='true'
+$env:LONG_MEMORY_PATH='data/long_memory.json'
+$env:LONG_MEMORY_MAX_FACTS='200'
+$env:LONG_MEMORY_AUTO_EXTRACT='true'
+$env:LONG_MEMORY_AUTO_EXTRACT_EVERY_TURNS='6'
+
+# v0.3 — Web search через Tavily
+$env:WEB_SEARCH_ENABLED='true'
+$env:WEB_SEARCH_PROVIDER='tavily'
+$env:TAVILY_API_KEY='tvly-...'
+$env:WEB_SEARCH_MAX_RESULTS='5'
+$env:WEB_SEARCH_TIMEOUT_SECONDS='15'
+$env:WEB_SEARCH_DEPTH='basic'
+$env:WEB_SEARCH_FOLLOWUP_IN_CHARACTER='true'
+
+# v0.3 — Code tools (mypy + ruff)
+$env:CODE_TOOLS_ENABLED='true'
+$env:CODE_TOOLS_PROJECT_ROOT='.'
+$env:CODE_TOOLS_TIMEOUT_SECONDS='30'
+$env:CODE_TOOLS_SELF_CHECK='false'
+$env:CODE_TOOLS_SELF_CHECK_MAX_SNIPPETS='2'
+$env:CODE_TOOLS_SELF_CHECK_MIN_LINES='3'
 ```
 
 Примечания:
@@ -769,7 +889,8 @@ $env:SYSTEM_ACTIONS_VSCODE_OPEN_WORKSPACE='true'
 - `RVC_WARM_UP='true'` заранее загружает базовый TTS, RVC-модель и embedder при старте, поэтому первая реплика после запуска меньше тормозит.
 - `RVC_BASE_TTS='silero'` использует Silero как базовый голос перед RVC. Можно попробовать `RVC_BASE_TTS='piper'`, но на текущем тесте он не оказался быстрее по общей задержке.
 - `RVC_PITCH='0'` оставляет тональность RVC без повышения; `RVC_F0_METHOD='rmvpe'` использует RMVPE.
-- `SYSTEM_ACTIONS_ENABLED='true'` включает безопасный allowlist действий: браузер, VS Code, папки, `.txt`, дописывание и ограниченное переименование.
+- `SYSTEM_ACTIONS_ENABLED='true'` включает безопасный tool layer: браузер, веб-поиск, VS Code, папки, `.txt`, дописывание и ограниченное переименование.
+- В Google AI chat и Gemini Live системные действия идут через structured function calling. В Ollama/DeepSeek остается локальный parser-fallback.
 - `SYSTEM_ACTIONS_DOCUMENT_DIR` задает папку для новых папок и текстовых документов. `desktop` кладет файлы на рабочий стол. Путь из голосовой команды не принимается, чтобы ассистент не писал куда попало.
 - `SYSTEM_ACTIONS_REGISTRY_PATH` хранит список файлов и папок, созданных Гертой. Переименовывать можно только объекты из этого списка.
 - Удаление, перемещение, перезапись файлов и произвольные shell-команды заблокированы на уровне кода, а не только промпта.
@@ -816,7 +937,7 @@ rg -n --hidden --glob '!venv/**' --glob '!.venv/**' --glob '!data/**' "sk-or-v1-
 Точечный `git add` для текущей версии, без `data/` и `.env`:
 
 ```powershell
-git add README.md config.py main.py doctor.py persona/the_herta.py actions/__init__.py actions/system_actions.py llm/google_ai_client.py llm/google_live_client.py stt/google_ai_stt.py
+git add README.md config.py main.py doctor.py persona/the_herta.py actions/__init__.py actions/tool_layer.py actions/system_actions.py llm/google_ai_client.py llm/google_live_client.py stt/google_ai_stt.py
 
 git diff --cached --name-only
 git commit -m "Add Gemini Live voice, safe OS actions, and Herta persona"
@@ -848,7 +969,7 @@ microphone -> VAD -> STT -> LLM -> TTS/RVC -> playback
 - Ассистент сохраняет последние реплики в `data/dialogue_memory.json` и подмешивает их в контекст после перезапуска.
 - Герта умеет открывать браузер, запускать VS Code, создавать папки, создавать и дописывать `.txt`, а также переименовывать только те файлы и папки, которые создала сама.
 - Удаление, перемещение, перезапись и произвольные команды PowerShell/CMD заблокированы.
-- Полный tool/agent-слой пока не реализован: системные действия работают через локальный allowlist, а не через свободное выполнение команд моделью.
+- Внутренний tool layer подключен к Gemini structured function calling в обычном Google AI chat и в Gemini Live. Модель не получает свободный доступ к PowerShell/CMD.
 
 ## Известные ограничения
 
@@ -861,7 +982,7 @@ microphone -> VAD -> STT -> LLM -> TTS/RVC -> playback
 ## Рекомендуемые следующие шаги
 
 1. Добавить поддержку wake word.
-2. Добавить action/tool layer для безопасного локального взаимодействия с компьютером.
+2. Расширить structured tools: чтение безопасных `.txt`, список созданных объектов, подтверждения для более рискованных действий.
 3. Четче разделить разговорный режим и task mode.
 4. Добавить память с жесткими границами использования.
 5. Улучшить двуязычное поведение STT и TTS.
