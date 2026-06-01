@@ -156,6 +156,9 @@ class SystemActionRunner:
         self.root_dir = _resolve_managed_root(config.document_dir)
         self.registry_path = _resolve_registry_path(config.registry_path)
         self._extra_tools: list[CallableTool] = list(extra_tools or [])
+        # Names of independent tools (web search, long-term memory, code tools). They have
+        # their own enable flags and must not be gated by SYSTEM_ACTIONS_ENABLED.
+        self._extra_tool_names: frozenset[str] = frozenset(tool.spec.name for tool in self._extra_tools)
         self.tools = self._build_tool_registry()
 
     def handle(self, user_text: str) -> SystemActionResult | None:
@@ -192,7 +195,9 @@ class SystemActionRunner:
                 executed=False,
             )
 
-        if not self.config.enabled:
+        # Only native filesystem/system actions are gated by SYSTEM_ACTIONS_ENABLED.
+        # Independent tools (web search, memory, code tools) run on their own flags.
+        if not self.config.enabled and tool_call.name not in self._extra_tool_names:
             return SystemActionResult(
                 action_name='system_actions_disabled',
                 message="Системные действия отключены. Включи SYSTEM_ACTIONS_ENABLED='true' и запусти Герту заново.",
@@ -432,7 +437,10 @@ class SystemActionRunner:
                 executed=False,
             )
 
-        args = [command]
+        # Always request a fresh window so the action is visible even when Herta is
+        # launched from inside VS Code; otherwise `code <dir>` silently reuses the
+        # already-open window and nothing appears.
+        args = [command, '--new-window']
         if self.config.vscode_open_workspace:
             args.append(str(Path.cwd()))
         subprocess.Popen(args, shell=False)
@@ -777,8 +785,25 @@ def _is_destructive_request(normalized: str) -> bool:
     return DESTRUCTIVE_RE.search(normalized) is not None
 
 
+VSCODE_MARKERS = (
+    'vscode',
+    'vs code',
+    'visual studio code',
+    'вскод',
+    'вс код',
+    'вс-код',
+    'вэскод',
+    'вэс код',
+    'вискод',
+    'вис код',
+    'vs код',
+    'визуал студио',
+    'визуальная студия',
+)
+
+
 def _mentions_vscode(normalized: str) -> bool:
-    return 'vscode' in normalized or 'vs code' in normalized or 'visual studio code' in normalized
+    return any(marker in normalized for marker in VSCODE_MARKERS)
 
 
 TEXT_DOCUMENT_RE = re.compile(
@@ -1040,12 +1065,39 @@ def _resolve_desktop_dir() -> Path:
     user_profile = os.getenv('USERPROFILE')
     if user_profile:
         candidates.append(Path(user_profile) / 'Desktop')
+
+    # On Linux the desktop folder may be localized (e.g. "Рабочий стол"); ask the
+    # XDG helper before falling back to the conventional ~/Desktop name.
+    xdg_desktop = _xdg_desktop_dir()
+    if xdg_desktop is not None:
+        candidates.append(xdg_desktop)
+
     candidates.append(Path.home() / 'Desktop')
 
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
     return candidates[0].resolve()
+
+
+def _xdg_desktop_dir() -> Path | None:
+    helper = shutil.which('xdg-user-dir')
+    if helper is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [helper, 'DESKTOP'],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    path_text = completed.stdout.strip()
+    if not path_text:
+        return None
+    return Path(path_text)
 
 
 def _unique_child_path(parent: Path, filename: str) -> Path:
@@ -1128,6 +1180,21 @@ def _strip_leading_trigger(original_text: str, normalized: str, triggers: tuple[
     return ''
 
 
+def _strip_trigger_anywhere(original_text: str, normalized: str, triggers: tuple[str, ...]) -> str | None:
+    # Like _strip_leading_trigger, but the trigger may stand anywhere in the phrase.
+    # The (longest) matched trigger is cut out and the surrounding words become the
+    # query, so both "погугли X" and "X, погугли" yield query "X". Returns None when
+    # no trigger is present, or '' when the phrase is only the trigger with no query.
+    if not _has_any(normalized, triggers):
+        return None
+    for trigger in sorted(triggers, key=len, reverse=True):
+        pattern = re.compile(r'\b' + re.escape(trigger) + r'\b', re.IGNORECASE)
+        if pattern.search(original_text) is not None:
+            remainder = pattern.sub(' ', original_text)
+            return re.sub(r'\s+', ' ', remainder).strip()
+    return ''
+
+
 def _strip_memory_modifiers(text: str) -> str:
     lowered = text.lower().strip()
     for prefix in (
@@ -1149,7 +1216,7 @@ def _detect_web_search_call(original_text: str, normalized: str) -> ToolCall | N
     # Реплика, которая явно про локальные файлы или папки — не наш кейс.
     has_filesystem_context = _mentions_text_document(normalized) or _mentions_folder(normalized)
 
-    explicit_payload = _strip_leading_trigger(original_text, normalized, WEB_SEARCH_EXPLICIT_TRIGGERS)
+    explicit_payload = _strip_trigger_anywhere(original_text, normalized, WEB_SEARCH_EXPLICIT_TRIGGERS)
     if explicit_payload is not None and not has_filesystem_context:
         cleaned = explicit_payload.strip(' ,.;:!?\'"`').strip()
         if cleaned:
@@ -1179,7 +1246,7 @@ def _build_search_query(
     *,
     prefix: str | None,
 ) -> str | None:
-    payload = _strip_leading_trigger(original_text, normalized, triggers)
+    payload = _strip_trigger_anywhere(original_text, normalized, triggers)
     if payload is None:
         return None
 

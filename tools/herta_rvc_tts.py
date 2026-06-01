@@ -234,7 +234,11 @@ def main() -> int:
         return 1
 
     applio_root = args.applio_root.resolve()
-    applio_python = args.applio_python.resolve()
+    # NOTE: do not resolve() the interpreter path. On Linux an Applio venv exposes
+    # python as a symlink (e.g. .venv/bin/python -> .../uv/.../python3.12); resolving
+    # it points at the real interpreter outside the venv, so site-packages (incl. the
+    # setuptools/distutils shim that core.py needs on Python 3.12) are not loaded.
+    applio_python = args.applio_python.expanduser()
     if not applio_python.exists():
         raise FileNotFoundError(f'Applio Python was not found: {applio_python}')
 

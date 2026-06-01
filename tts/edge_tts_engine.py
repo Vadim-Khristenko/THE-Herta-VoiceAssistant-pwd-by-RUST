@@ -1,12 +1,13 @@
 ﻿import asyncio
 import base64
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import edge_tts
 import numpy as np
-from edge_playback.win32_playback import play_mp3_win32
 from piper import PiperVoice
 
 from audio.output import SpeakerOutput
@@ -14,6 +15,16 @@ from config import AudioOutputConfig, EdgeTTSConfig
 
 
 WINDOWS_POWERSHELL = r'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe'
+
+# Standalone CLI players used for Edge TTS MP3 playback on non-Windows systems
+# when ffmpeg (preferred, routes through the configured output device) is absent.
+# Each entry maps a binary name to the argv that plays a file and exits quietly.
+_MP3_PLAYER_ARGS: dict[str, list[str]] = {
+    'ffplay': ['-autoexit', '-nodisp', '-loglevel', 'quiet'],
+    'mpv': ['--no-video', '--really-quiet'],
+    'cvlc': ['--play-and-exit', '--intf', 'dummy'],
+    'mpg123': ['-q'],
+}
 
 
 class EdgeTTSEngine:
@@ -108,9 +119,67 @@ $text = [System.Text.Encoding]::UTF8.GetString($bytes)
 
         try:
             asyncio.run(self._save_to_file(text, mp3_path))
-            play_mp3_win32(str(mp3_path))
+            self._play_mp3(mp3_path)
         finally:
             mp3_path.unlink(missing_ok=True)
+
+    def _play_mp3(self, mp3_path: Path) -> None:
+        if sys.platform == 'win32':
+            from edge_playback.win32_playback import play_mp3_win32
+
+            play_mp3_win32(str(mp3_path))
+            return
+        self._play_mp3_cross_platform(mp3_path)
+
+    def _play_mp3_cross_platform(self, mp3_path: Path) -> None:
+        # ffmpeg decodes to raw PCM so playback honours the configured output
+        # device (AUDIO_OUTPUT_DEVICE), matching the rest of the audio pipeline.
+        ffmpeg = shutil.which('ffmpeg')
+        if ffmpeg is not None:
+            self._play_mp3_via_ffmpeg(ffmpeg, mp3_path)
+            return
+
+        # No ffmpeg: fall back to whichever standalone player is installed. These
+        # use the system default output device rather than AUDIO_OUTPUT_DEVICE.
+        for player, extra_args in _MP3_PLAYER_ARGS.items():
+            binary = shutil.which(player)
+            if binary is None:
+                continue
+            subprocess.run(
+                [binary, *extra_args, str(mp3_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+
+        raise RuntimeError(
+            'No MP3 player available for Edge TTS playback. Install ffmpeg '
+            '(recommended) or one of: ffplay, mpv, vlc, mpg123.'
+        )
+
+    def _play_mp3_via_ffmpeg(self, ffmpeg: str, mp3_path: Path) -> None:
+        channels = max(1, self.output.config.channels)
+        sample_rate = self.output.config.sample_rate
+        process = subprocess.run(
+            [
+                ffmpeg,
+                '-loglevel', 'quiet',
+                '-i', str(mp3_path),
+                '-f', 'f32le',
+                '-acodec', 'pcm_f32le',
+                '-ac', str(channels),
+                '-ar', str(sample_rate),
+                'pipe:1',
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        audio = np.frombuffer(process.stdout, dtype=np.float32)
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+        self.output.play_audio(audio, sample_rate=sample_rate)
 
     def speak(self, text: str) -> None:
         normalized_text = text.strip()
@@ -122,16 +191,19 @@ $text = [System.Text.Encoding]::UTF8.GetString($bytes)
         if piper_path is not None:
             attempts.append(('piper', self._speak_with_piper))
 
+        # SAPI is a Windows-only backend (it drives SAPI.SpVoice via PowerShell);
+        # on other platforms only Edge TTS remains as the local-preferred path.
+        local_backends: list[tuple[str, callable]] = []
+        if sys.platform == 'win32':
+            local_backends.append(('sapi', self._speak_with_sapi))
+        edge_backend = ('edge', self._speak_with_edge)
+
         if self.config.prefer_local:
-            attempts.extend([
-                ('sapi', self._speak_with_sapi),
-                ('edge', self._speak_with_edge),
-            ])
+            attempts.extend(local_backends)
+            attempts.append(edge_backend)
         else:
-            attempts.extend([
-                ('edge', self._speak_with_edge),
-                ('sapi', self._speak_with_sapi),
-            ])
+            attempts.append(edge_backend)
+            attempts.extend(local_backends)
 
         errors: list[str] = []
         for backend_name, backend in attempts:
