@@ -21,12 +21,18 @@
 >
 > | Crate | Ответственность |
 > |-------|-----------------|
-> | `herta-core` | ошибки, сообщения, конфиг, персона+лор, память, автосжатие контекста |
-> | `herta-llm` | трейт `ChatClient` + Ollama / OpenAI-совместимые / Google AI |
-> | `herta-tools` | реестр инструментов, память, веб-поиск, анализ кода, системные действия |
-> | `herta-agent` | оркестрация саб-агентов («марионеток») через tokio |
-> | `herta-tui` | современный TUI на ratatui/crossterm с панелью агентов |
+> | `herta-core` | ошибки, сообщения, конфиг, персона+лор, память, автосжатие контекста, формат навыков `.herta` |
+> | `herta-llm` | трейт `ChatClient` + Ollama / OpenAI-совместимые / Google AI / **Anthropic (Claude)** |
+> | `herta-tools` | реестр инструментов: git, файлы, fetch_url, время, память, веб-поиск, анализ кода, системные действия, навыки |
+> | `herta-agent` | оркестрация саб-агентов + **нативный tool-loop** |
+> | `herta-tui` | современный TUI на ratatui/crossterm, панель агентов, команды `/goal /ask /tools /compact /say` |
+> | `herta-voice` | озвучивание ответов (TTS) через системные утилиты |
 > | `herta-cli` | бинарь `herta` (TUI / `--text` / `doctor`) |
+>
+> **Инструменты агента:** `git_status/log/diff/branches`, `read_file`, `list_dir`,
+> `fetch_url`, `current_time`, `web_search`, `type_check`/`lint_code`,
+> `open_url`/`create_note`, `remember`/`recall`/`forget`, `list_skills`/`use_skill`.
+> Все с детальными описаниями, чтобы любая LLM понимала, когда их применять.
 >
 > Подробности: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) ·
 > досье персонажа: [`docs/HERTA.md`](docs/HERTA.md).

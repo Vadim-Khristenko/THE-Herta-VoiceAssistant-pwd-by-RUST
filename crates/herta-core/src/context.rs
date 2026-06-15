@@ -93,6 +93,26 @@ impl ContextManager {
         })
     }
 
+    /// Построить план сжатия принудительно (по команде пользователя), игнорируя
+    /// порог токенов, но сохраняя структурные требования (префикс + хвост).
+    pub fn force_plan(&self, messages: &[Message]) -> Option<CompactionPlan> {
+        let prefix = Self::pinned_prefix_len(messages);
+        let total = messages.len();
+        if total < prefix + 2 + self.keep_recent {
+            return None;
+        }
+        let end = total - self.keep_recent;
+        if end <= prefix {
+            return None;
+        }
+        Some(CompactionPlan {
+            pinned_prefix_len: prefix,
+            summarize_range: (prefix, end),
+            keep_recent: self.keep_recent,
+            tokens_before: estimate_total_tokens(messages),
+        })
+    }
+
     /// Системный промпт для модели-суммаризатора (в образе Герты, но по делу).
     pub fn summarizer_system_prompt() -> &'static str {
         "Ты сжимаешь историю диалога Великой Герты с пользователем. \

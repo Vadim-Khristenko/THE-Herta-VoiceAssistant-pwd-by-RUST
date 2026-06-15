@@ -1,7 +1,8 @@
 //! Управляющий цикл TUI. Единый `tokio::select!`-селектор сводит три источника:
 //! события терминала (crossterm `EventStream`), ответы модели и поток событий
 //! саб-агентов. Главный поток только читает каналы и рендерит — тяжёлая работа
-//! уходит в отдельные таски, поэтому интерфейс не блокируется.
+//! (запросы к модели, нативный tool-loop, саб-агенты) уходит в отдельные таски,
+//! поэтому интерфейс не блокируется.
 
 use crate::state::{AppState, ChatLine, Focus};
 use crate::theme::Theme;
@@ -15,13 +16,15 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use futures::StreamExt;
-use herta_agent::{AgentEvent, AgentStatus, AgentTask, Supervisor};
+use herta_agent::{run_tool_loop, AgentEvent, AgentStatus, AgentTask, Supervisor};
 use herta_core::persona;
 use herta_core::{
     estimate_total_tokens, CompactionDecision, CompactionPlan, ContextManager, HertaError, Message,
     Result,
 };
 use herta_llm::ChatClient;
+use herta_tools::ToolRegistry;
+use herta_voice::Voice;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Stdout};
@@ -42,9 +45,15 @@ pub struct App {
     state: AppState,
     theme: Theme,
     client: Arc<dyn ChatClient>,
+    registry: Arc<ToolRegistry>,
     supervisor: Supervisor,
     ctx_manager: ContextManager,
+    voice: Voice,
     conversation: Vec<Message>,
+    /// Текущая цель пользователя (команда /goal), инъектируется в каждый запрос.
+    goal: Option<String>,
+    /// Предел итераций нативного tool-loop.
+    tool_iterations: usize,
     show_help: bool,
     backend_tx: mpsc::UnboundedSender<Backend>,
     backend_rx: mpsc::UnboundedReceiver<Backend>,
@@ -53,11 +62,15 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         client: Arc<dyn ChatClient>,
+        registry: Arc<ToolRegistry>,
         supervisor: Supervisor,
         ctx_manager: ContextManager,
+        voice: Voice,
         context_limit: usize,
+        tool_iterations: usize,
         long_memory_block: Option<String>,
     ) -> Self {
         let provider = client.provider_name().to_string();
@@ -70,14 +83,24 @@ impl App {
 
         let mut state = AppState::new(provider, model, context_limit);
         state.context_used = estimate_total_tokens(&conversation);
+        let tool_count = registry.len();
+        if tool_count > 0 {
+            state.push_line(ChatLine::notice(format!(
+                "Доступно инструментов: {tool_count}. Команды: /goal /ask /tools /compact /model /help."
+            )));
+        }
 
         Self {
             state,
             theme: Theme::default(),
             client,
+            registry,
             supervisor,
             ctx_manager,
+            voice,
             conversation,
+            goal: None,
+            tool_iterations: tool_iterations.max(1),
             show_help: false,
             backend_tx,
             backend_rx,
@@ -105,7 +128,6 @@ impl App {
 
         while !self.state.should_quit {
             tokio::select! {
-                // 1. События терминала.
                 maybe_event = events.next() => {
                     match maybe_event {
                         Some(Ok(event)) => self.handle_terminal_event(event),
@@ -113,15 +135,8 @@ impl App {
                         None => self.state.should_quit = true,
                     }
                 }
-                // 2. Ответы модели / суммаризатора.
-                Some(msg) = self.backend_rx.recv() => {
-                    self.handle_backend(msg);
-                }
-                // 3. Поток событий саб-агентов.
-                Some(ev) = self.agent_rx.recv() => {
-                    self.handle_agent_event(ev);
-                }
-                // 4. Тик для плавной перерисовки во время ожидания.
+                Some(msg) = self.backend_rx.recv() => self.handle_backend(msg),
+                Some(ev) = self.agent_rx.recv() => self.handle_agent_event(ev),
                 _ = ticker.tick() => {}
             }
             self.draw(terminal)?;
@@ -146,7 +161,6 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Глобальные сочетания.
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             self.state.should_quit = true;
             return;
@@ -175,11 +189,8 @@ impl App {
             KeyCode::Backspace => {
                 self.state.input.pop();
             }
-            KeyCode::Char(c) => {
-                if self.state.focus == Focus::Input {
-                    self.state.input.push(c);
-                }
-            }
+            // Слияние ввода и условия в один match-arm — clippy::collapsible_match.
+            KeyCode::Char(c) if self.state.focus == Focus::Input => self.state.input.push(c),
             _ => {}
         }
     }
@@ -212,23 +223,38 @@ impl App {
         self.state.push_line(ChatLine::user(text.clone()));
         self.conversation.push(Message::user(text));
         self.recompute_context();
+        self.dispatch_turn();
+    }
 
-        // Возможная разговорная подсказка добавляется как системная реплика.
+    /// Отправить текущий контекст в модель через нативный tool-loop.
+    fn dispatch_turn(&mut self) {
         let mut request = self.conversation.clone();
-        if let Some(hint) = persona::build_conversational_hint(
-            request.last().map(|m| m.content.as_str()).unwrap_or(""),
-        ) {
+        let last_user = request
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, herta_core::Role::User))
+            .map(|m| m.content.clone())
+            .unwrap_or_default();
+        if let Some(hint) = persona::build_conversational_hint(&last_user) {
             request.push(Message::system(hint));
+        }
+        if let Some(goal) = &self.goal {
+            request.push(Message::system(format!(
+                "Текущая цель пользователя: {goal}. Держи её в фокусе."
+            )));
         }
 
         self.state.busy = true;
         self.state.status = "запрос к модели…".into();
 
         let client = Arc::clone(&self.client);
+        let registry = Arc::clone(&self.registry);
         let tx = self.backend_tx.clone();
+        let iters = self.tool_iterations;
         tokio::spawn(async move {
-            let msg = match client.chat(&request).await {
-                Ok(reply) => Backend::Reply(reply),
+            let msg = match run_tool_loop(client.as_ref(), registry.as_ref(), &request, iters).await
+            {
+                Ok(outcome) => Backend::Reply(outcome.text),
                 Err(e) => Backend::ReplyError(e.to_string()),
             };
             let _ = tx.send(msg);
@@ -239,35 +265,114 @@ impl App {
         let (head, tail) = command
             .split_once(char::is_whitespace)
             .unwrap_or((command, ""));
+        let tail = tail.trim();
         match head {
             "quit" | "q" | "exit" => self.state.should_quit = true,
+            "help" | "h" => self.show_help = true,
             "clear" => {
                 self.state.lines.clear();
                 self.state.push_line(ChatLine::notice("Лента очищена."));
             }
+            "model" => {
+                self.state.push_line(ChatLine::notice(format!(
+                    "Провайдер: {} · модель: {} · контекст: {}/{} токенов",
+                    self.state.provider_label,
+                    self.state.model_label,
+                    self.state.context_used,
+                    self.state.context_limit
+                )));
+            }
+            "tools" => {
+                let mut specs = self.registry.specs();
+                specs.sort_by(|a, b| a.name.cmp(&b.name));
+                if specs.is_empty() {
+                    self.state
+                        .push_line(ChatLine::notice("Инструменты не подключены."));
+                } else {
+                    let listing = specs
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "• {} — {}",
+                                s.name,
+                                s.description.lines().next().unwrap_or("")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.state.push_line(ChatLine::notice(format!(
+                        "Инструменты ({}):\n{listing}",
+                        specs.len()
+                    )));
+                }
+            }
+            "goal" => {
+                if tail.is_empty() {
+                    match &self.goal {
+                        Some(g) => self
+                            .state
+                            .push_line(ChatLine::notice(format!("Текущая цель: {g}"))),
+                        None => self
+                            .state
+                            .push_line(ChatLine::notice("Использование: /goal <описание цели>")),
+                    }
+                } else {
+                    self.goal = Some(tail.to_string());
+                    self.state
+                        .push_line(ChatLine::notice(format!("Цель установлена: {tail}")));
+                    // Сразу просим Герту составить план через навык goal-planning.
+                    let planning = format!(
+                        "Моя цель: {tail}. Используй навык goal-planning (list_skills/use_skill), составь план и начни."
+                    );
+                    self.state.push_line(ChatLine::user(planning.clone()));
+                    self.conversation.push(Message::user(planning));
+                    self.recompute_context();
+                    self.dispatch_turn();
+                }
+            }
+            "ask" => {
+                if tail.is_empty() {
+                    self.state
+                        .push_line(ChatLine::notice("Использование: /ask <вопрос саб-агенту>"));
+                } else {
+                    self.spawn_agent("вопрос", tail);
+                }
+            }
             "agent" => {
-                let task_text = tail.trim();
-                if task_text.is_empty() {
+                if tail.is_empty() {
                     self.state
                         .push_line(ChatLine::notice("Использование: /agent <описание задачи>"));
                 } else {
-                    self.spawn_agent(task_text);
+                    self.spawn_agent("задача", tail);
                 }
             }
-            other => {
-                self.state
-                    .push_line(ChatLine::notice(format!("Неизвестная команда: /{other}")));
+            "compact" => self.force_compact(),
+            "say" => {
+                if !self.voice.is_available() {
+                    self.state.push_line(ChatLine::notice(
+                        "TTS недоступен (нет say/espeak/powershell).",
+                    ));
+                } else if tail.is_empty() {
+                    self.state
+                        .push_line(ChatLine::notice("Использование: /say <текст для озвучки>"));
+                } else {
+                    self.voice.speak(tail);
+                    self.state.push_line(ChatLine::notice("Озвучиваю."));
+                }
             }
+            other => self
+                .state
+                .push_line(ChatLine::notice(format!("Неизвестная команда: /{other}"))),
         }
     }
 
-    fn spawn_agent(&mut self, task_text: &str) {
+    fn spawn_agent(&mut self, kind: &str, task_text: &str) {
         let title: String = task_text.chars().take(28).collect();
         let task = AgentTask::new(title.clone(), task_text.to_string());
         self.state
             .upsert_agent(&task.id, Some(title), AgentStatus::Pending, None);
         self.state.push_line(ChatLine::notice(format!(
-            "Марионетка отправлена: {task_text}"
+            "Марионетка ({kind}): {task_text}"
         )));
         self.supervisor.spawn(task, self.agent_tx.clone());
     }
@@ -275,12 +380,16 @@ impl App {
     fn handle_backend(&mut self, msg: Backend) {
         match msg {
             Backend::Reply(reply) => {
-                let mut reply = reply;
+                let reply = if reply.trim().is_empty() {
+                    "Пустой ответ модели. Уточните запрос.".to_string()
+                } else {
+                    reply
+                };
                 if persona::needs_persona_repair(&reply) {
-                    self.state.status = "персона повреждена, оставляю как есть".into();
+                    self.state.status = "персона under repair".into();
                 }
-                if reply.trim().is_empty() {
-                    reply = "Пустой ответ модели. Уточните запрос.".into();
+                if self.voice.is_enabled() {
+                    self.voice.speak(&reply);
                 }
                 self.state.push_line(ChatLine::herta(reply.clone()));
                 self.conversation.push(Message::assistant(reply));
@@ -299,9 +408,8 @@ impl App {
                 self.conversation = ContextManager::apply(&self.conversation, &plan, &text);
                 self.state.busy = false;
                 self.state.status = "контекст сжат".into();
-                self.state.push_line(ChatLine::notice(
-                    "Контекст автоматически сжат для экономии окна.",
-                ));
+                self.state
+                    .push_line(ChatLine::notice("Контекст сжат для экономии окна."));
                 self.recompute_context();
             }
             Backend::SummaryError(err) => {
@@ -344,25 +452,44 @@ impl App {
         self.state.context_used = estimate_total_tokens(&self.conversation);
     }
 
-    /// Проверить порог и при необходимости запустить асинхронное сжатие.
+    /// Автосжатие при достижении порога.
     fn maybe_compact(&mut self) {
         if self.state.busy {
             return;
         }
         if let CompactionDecision::Compact(plan) = self.ctx_manager.decide(&self.conversation) {
-            let request = ContextManager::build_summarization_request(&self.conversation, &plan);
-            self.state.busy = true;
-            self.state.status = "сжимаю контекст…".into();
-            let client = Arc::clone(&self.client);
-            let tx = self.backend_tx.clone();
-            tokio::spawn(async move {
-                let msg = match client.chat(&request).await {
-                    Ok(text) => Backend::Summary { plan, text },
-                    Err(e) => Backend::SummaryError(e.to_string()),
-                };
-                let _ = tx.send(msg);
-            });
+            self.run_compaction(plan);
         }
+    }
+
+    /// Принудительное сжатие по команде /compact.
+    fn force_compact(&mut self) {
+        if self.state.busy {
+            self.state
+                .push_line(ChatLine::notice("Занята; сжатие после ответа."));
+            return;
+        }
+        match self.ctx_manager.force_plan(&self.conversation) {
+            Some(plan) => self.run_compaction(plan),
+            None => self
+                .state
+                .push_line(ChatLine::notice("Недостаточно истории для сжатия.")),
+        }
+    }
+
+    fn run_compaction(&mut self, plan: CompactionPlan) {
+        let request = ContextManager::build_summarization_request(&self.conversation, &plan);
+        self.state.busy = true;
+        self.state.status = "сжимаю контекст…".into();
+        let client = Arc::clone(&self.client);
+        let tx = self.backend_tx.clone();
+        tokio::spawn(async move {
+            let msg = match client.chat(&request).await {
+                Ok(text) => Backend::Summary { plan, text },
+                Err(e) => Backend::SummaryError(e.to_string()),
+            };
+            let _ = tx.send(msg);
+        });
     }
 }
 

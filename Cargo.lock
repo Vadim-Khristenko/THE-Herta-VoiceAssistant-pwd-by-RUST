@@ -562,6 +562,7 @@ dependencies = [
  "herta-llm",
  "herta-tools",
  "herta-tui",
+ "herta-voice",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -621,8 +622,17 @@ dependencies = [
  "herta-core",
  "herta-llm",
  "herta-tools",
+ "herta-voice",
  "ratatui",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "herta-voice"
+version = "0.4.0"
+dependencies = [
+ "herta-core",
  "tracing",
 ]
 

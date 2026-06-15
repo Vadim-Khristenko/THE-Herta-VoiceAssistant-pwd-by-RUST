@@ -12,6 +12,7 @@ herta-core.workspace = true
 herta-llm.workspace = true
 herta-tools.workspace = true
 herta-agent.workspace = true
+herta-voice.workspace = true
 tokio.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

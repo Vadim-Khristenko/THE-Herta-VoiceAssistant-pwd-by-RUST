@@ -286,11 +286,31 @@ pub fn render_help(frame: &mut Frame, theme: &Theme) {
         Line::from(""),
         Line::from(Span::styled("Команды:", theme.title())),
         Line::from(Span::styled(
-            "/agent <текст>  запустить саб-агента",
+            "/goal <текст>   задать цель и план",
             theme.dim(),
         )),
-        Line::from(Span::styled("/clear          очистить ленту", theme.dim())),
-        Line::from(Span::styled("/quit           выход", theme.dim())),
+        Line::from(Span::styled(
+            "/ask <текст>    вопрос саб-агенту",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "/agent <текст>  задача саб-агенту",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "/tools          список инструментов",
+            theme.dim(),
+        )),
+        Line::from(Span::styled("/compact        сжать контекст", theme.dim())),
+        Line::from(Span::styled("/say <текст>    озвучить (TTS)", theme.dim())),
+        Line::from(Span::styled(
+            "/model          модель и контекст",
+            theme.dim(),
+        )),
+        Line::from(Span::styled(
+            "/clear /quit    очистить / выход",
+            theme.dim(),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true }),

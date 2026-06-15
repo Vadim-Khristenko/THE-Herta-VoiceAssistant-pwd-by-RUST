@@ -18,6 +18,7 @@ pub mod long_memory;
 pub mod memory;
 pub mod message;
 pub mod persona;
+pub mod skill;
 pub mod tool;
 
 pub use config::{AppConfig, LlmProvider};
@@ -26,6 +27,7 @@ pub use error::{HertaError, Result};
 pub use long_memory::{Fact, FactCategory, FactSource, LongMemoryStore};
 pub use memory::DialogueMemory;
 pub use message::{estimate_tokens, estimate_total_tokens, Message, Role};
+pub use skill::{load_dir as load_skills, Skill};
 pub use tool::{ParamType, ToolCall, ToolParameter, ToolResult, ToolSpec};
 
 /// Версия рабочего пространства (из Cargo).

@@ -16,6 +16,7 @@ herta-core.workspace = true
 herta-llm.workspace = true
 herta-tools.workspace = true
 herta-agent.workspace = true
+herta-voice.workspace = true
 herta-tui.workspace = true
 tokio.workspace = true
 clap.workspace = true

@@ -57,6 +57,7 @@ pub enum LlmProvider {
     Cerebras,
     DeepSeek,
     GoogleAi,
+    Anthropic,
 }
 
 impl LlmProvider {
@@ -65,6 +66,7 @@ impl LlmProvider {
             "cerebras" => Self::Cerebras,
             "deepseek" => Self::DeepSeek,
             "google_ai" | "google" | "gemini" => Self::GoogleAi,
+            "anthropic" | "claude" => Self::Anthropic,
             _ => Self::Ollama,
         }
     }
@@ -75,6 +77,7 @@ impl LlmProvider {
             Self::Cerebras => "cerebras",
             Self::DeepSeek => "deepseek",
             Self::GoogleAi => "google_ai",
+            Self::Anthropic => "anthropic",
         }
     }
 }
@@ -144,6 +147,34 @@ impl Default for GoogleAiConfig {
             max_tokens: 700,
             live_model: "gemini-3.1-flash-live-preview".into(),
             live_voice_name: Some("Kore".into()),
+        }
+    }
+}
+
+/// Конфиг Anthropic Messages API (Claude). Raw HTTP — официального Rust SDK нет.
+/// Для семейства 4.x не передаём temperature/top_p (API их отвергает 400).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicConfig {
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub model: String,
+    pub api_version: String,
+    pub max_tokens: u32,
+    pub timeout_seconds: f64,
+    pub retry_attempts: u32,
+}
+
+impl Default for AnthropicConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            base_url: "https://api.anthropic.com/v1".into(),
+            // По умолчанию — самый мощный Opus; пользователь может задать sonnet/haiku.
+            model: "claude-opus-4-8".into(),
+            api_version: "2023-06-01".into(),
+            max_tokens: 1024,
+            timeout_seconds: 120.0,
+            retry_attempts: 3,
         }
     }
 }
@@ -312,6 +343,8 @@ pub struct AgentConfig {
     pub max_concurrent: usize,
     /// Таймаут на одного саб-агента.
     pub timeout_seconds: u64,
+    /// Предел итераций нативного tool-loop (защита от бесконечных вызовов).
+    pub tool_loop_iterations: usize,
 }
 
 impl Default for AgentConfig {
@@ -320,8 +353,21 @@ impl Default for AgentConfig {
             enabled: true,
             max_concurrent: 4,
             timeout_seconds: 180,
+            tool_loop_iterations: 6,
         }
     }
+}
+
+/// Озвучивание ответов (TTS). Реализация — внешняя системная утилита, поэтому
+/// нативных зависимостей нет. STT (распознавание) — задача следующей итерации.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    /// Озвучивать ответы Герты автоматически.
+    pub enabled: bool,
+    /// Явная команда TTS (переопределяет автоопределение по ОС).
+    pub tts_command: Option<String>,
+    /// Имя голоса (для систем, где это применимо, напр. macOS `say -v`).
+    pub voice_name: Option<String>,
 }
 
 /// Корневая конфигурация приложения.
@@ -336,6 +382,7 @@ pub struct AppConfig {
     pub cerebras: OpenAiCompatConfig,
     pub deepseek: OpenAiCompatConfig,
     pub google_ai: GoogleAiConfig,
+    pub anthropic: AnthropicConfig,
     pub memory: MemoryConfig,
     pub long_memory: LongMemoryConfig,
     pub web_search: WebSearchConfig,
@@ -344,6 +391,7 @@ pub struct AppConfig {
     pub wakeword: WakeWordConfig,
     pub context: ContextConfig,
     pub agent: AgentConfig,
+    pub voice: VoiceConfig,
 }
 
 impl Default for AppConfig {
@@ -376,6 +424,7 @@ impl Default for AppConfig {
                 rate_limit_retries: 2,
             },
             google_ai: GoogleAiConfig::default(),
+            anthropic: AnthropicConfig::default(),
             memory: MemoryConfig::default(),
             long_memory: LongMemoryConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -384,6 +433,7 @@ impl Default for AppConfig {
             wakeword: WakeWordConfig::default(),
             context: ContextConfig::default(),
             agent: AgentConfig::default(),
+            voice: VoiceConfig::default(),
         }
     }
 }
@@ -447,6 +497,16 @@ impl AppConfig {
             max_tokens: env_parse("GOOGLE_AI_MAX_TOKENS", 700),
             live_model: env_str("GOOGLE_AI_LIVE_MODEL", "gemini-3.1-flash-live-preview"),
             live_voice_name: env_opt("GOOGLE_AI_LIVE_VOICE").or_else(|| Some("Kore".into())),
+        };
+
+        cfg.anthropic = AnthropicConfig {
+            api_key: env_opt("ANTHROPIC_API_KEY"),
+            base_url: env_str("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+            model: env_str("ANTHROPIC_MODEL", "claude-opus-4-8"),
+            api_version: env_str("ANTHROPIC_VERSION", "2023-06-01"),
+            max_tokens: env_parse("ANTHROPIC_MAX_TOKENS", 1024),
+            timeout_seconds: env_parse("ANTHROPIC_TIMEOUT_SECONDS", 120.0),
+            retry_attempts: env_parse("ANTHROPIC_RETRY_ATTEMPTS", 3),
         };
 
         cfg.memory = MemoryConfig {
@@ -519,6 +579,13 @@ impl AppConfig {
             enabled: env_bool("AGENT_ENABLED", true),
             max_concurrent: env_parse("AGENT_MAX_CONCURRENT", 4),
             timeout_seconds: env_parse("AGENT_TIMEOUT_SECONDS", 180),
+            tool_loop_iterations: env_parse("AGENT_TOOL_ITERATIONS", 6),
+        };
+
+        cfg.voice = VoiceConfig {
+            enabled: env_bool("VOICE_ENABLED", false),
+            tts_command: env_opt("VOICE_TTS_COMMAND"),
+            voice_name: env_opt("VOICE_NAME"),
         };
 
         cfg
@@ -531,6 +598,7 @@ impl AppConfig {
             LlmProvider::Cerebras => &self.cerebras.model,
             LlmProvider::DeepSeek => &self.deepseek.model,
             LlmProvider::GoogleAi => &self.google_ai.model,
+            LlmProvider::Anthropic => &self.anthropic.model,
         }
     }
 }

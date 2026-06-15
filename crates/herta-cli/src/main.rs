@@ -6,11 +6,13 @@ mod doctor;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use herta_agent::Supervisor;
+use herta_agent::{run_tool_loop, Supervisor};
 use herta_core::persona;
 use herta_core::{AppConfig, ContextManager, DialogueMemory, LongMemoryStore, Message};
 use herta_llm::ChatClient;
+use herta_tools::ToolRegistry;
 use herta_tui::App;
+use tokio::sync::Mutex;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -67,13 +69,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Блок долговременной памяти для инъекции в системный промпт.
-fn long_memory_block(config: &AppConfig) -> Option<String> {
-    if !config.long_memory.enabled {
-        return None;
-    }
-    let store = LongMemoryStore::load(&config.long_memory.path, config.long_memory.max_facts, true);
-    store.format_for_prompt()
+/// Загрузить долговременную память, вернуть общий стор и блок для промпта.
+fn load_long_memory(config: &AppConfig) -> (Arc<Mutex<LongMemoryStore>>, Option<String>) {
+    let store = LongMemoryStore::load(
+        &config.long_memory.path,
+        config.long_memory.max_facts,
+        config.long_memory.enabled,
+    );
+    let block = if config.long_memory.enabled {
+        store.format_for_prompt()
+    } else {
+        None
+    };
+    (Arc::new(Mutex::new(store)), block)
 }
 
 async fn run_tui(config: AppConfig) -> anyhow::Result<()> {
@@ -88,19 +96,28 @@ async fn run_tui(config: AppConfig) -> anyhow::Result<()> {
         });
     }
 
+    let (long_memory, mem_block) = load_long_memory(&config);
+    let registry = Arc::new(herta_tools::build_registry(
+        &config,
+        Arc::clone(&long_memory),
+    ));
+
     let supervisor = Supervisor::new(
         Arc::clone(&client),
         &config.agent,
         persona::build_system_prompt(Some(client.model_name())),
     );
     let ctx_manager = ContextManager::new(&config.context);
-    let mem_block = long_memory_block(&config);
+    let voice = herta_voice::Voice::from_config(&config.voice);
 
     let app = App::new(
         client,
+        registry,
         supervisor,
         ctx_manager,
+        voice,
         config.context.max_tokens,
+        config.agent.tool_loop_iterations,
         mem_block,
     );
     app.run().await?;
@@ -117,10 +134,11 @@ async fn run_oneshot(config: &AppConfig, prompt: &str) -> anyhow::Result<()> {
     let client = herta_llm::build_client(config)?;
     client.warm_up().await?;
 
-    let mut messages = persona::build_bootstrap_messages(
-        Some(client.model_name()),
-        long_memory_block(config).as_deref(),
-    );
+    let (long_memory, mem_block) = load_long_memory(config);
+    let registry: ToolRegistry = herta_tools::build_registry(config, long_memory);
+
+    let mut messages =
+        persona::build_bootstrap_messages(Some(client.model_name()), mem_block.as_deref());
     // Кратковременная история для связности.
     let memory = DialogueMemory::new(
         &config.memory.path,
@@ -131,11 +149,18 @@ async fn run_oneshot(config: &AppConfig, prompt: &str) -> anyhow::Result<()> {
     messages.extend(memory.load_context_messages());
     messages.push(Message::user(prompt.to_string()));
 
-    let reply = client.chat(&messages).await?;
-    let reply = if reply.trim().is_empty() {
+    // Одноразовый режим тоже проходит через нативный tool-loop.
+    let outcome = run_tool_loop(
+        client.as_ref(),
+        &registry,
+        &messages,
+        config.agent.tool_loop_iterations,
+    )
+    .await?;
+    let reply = if outcome.text.trim().is_empty() {
         "Пустой ответ модели.".to_string()
     } else {
-        reply
+        outcome.text
     };
     println!("{reply}");
     memory.append_turn(prompt, &reply)?;

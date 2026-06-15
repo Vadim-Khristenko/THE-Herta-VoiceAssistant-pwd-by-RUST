@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod tool_loop;
+
+pub use tool_loop::{run as run_tool_loop, ToolLoopOutcome};
+
 use herta_core::config::AgentConfig;
 use herta_core::{Message, ToolResult};
 use herta_llm::ChatClient;

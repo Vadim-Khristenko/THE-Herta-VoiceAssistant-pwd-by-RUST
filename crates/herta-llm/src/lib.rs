@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod anthropic;
 pub mod google;
 pub mod ollama;
 pub mod openai_compat;
@@ -87,6 +88,13 @@ pub fn build_client(config: &AppConfig) -> Result<Box<dyn ChatClient>> {
                 return Err(HertaError::llm("google_ai", "не задан GOOGLE_AI_API_KEY"));
             }
             Ok(Box::new(google::GoogleAiClient::new(c)?))
+        }
+        LlmProvider::Anthropic => {
+            let c = config.anthropic.clone();
+            if c.api_key.is_none() {
+                return Err(HertaError::llm("anthropic", "не задан ANTHROPIC_API_KEY"));
+            }
+            Ok(Box::new(anthropic::AnthropicClient::new(c)?))
         }
     }
 }

@@ -8,6 +8,7 @@ members = [
     "crates/herta-llm",
     "crates/herta-tools",
     "crates/herta-agent",
+    "crates/herta-voice",
     "crates/herta-tui",
     "crates/herta-cli",
 ]
@@ -27,6 +28,7 @@ herta-core = { path = "crates/herta-core" }
 herta-llm = { path = "crates/herta-llm" }
 herta-tools = { path = "crates/herta-tools" }
 herta-agent = { path = "crates/herta-agent" }
+herta-voice = { path = "crates/herta-voice" }
 herta-tui = { path = "crates/herta-tui" }
 
 # Async runtime и сеть.

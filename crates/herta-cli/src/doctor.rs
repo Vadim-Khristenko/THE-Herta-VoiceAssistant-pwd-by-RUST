@@ -57,6 +57,10 @@ pub async fn run(config: &AppConfig) -> i32 {
             line(Level::Fail, "Google AI", "не задан GOOGLE_AI_API_KEY");
             fails += 1;
         }
+        LlmProvider::Anthropic if config.anthropic.api_key.is_none() => {
+            line(Level::Fail, "Anthropic", "не задан ANTHROPIC_API_KEY");
+            fails += 1;
+        }
         _ => {}
     }
 
