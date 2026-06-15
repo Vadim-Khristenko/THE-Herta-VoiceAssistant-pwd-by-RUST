@@ -1,0 +1,18 @@
+[package]
+name = "herta-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Core types, config, persona and errors for The Herta assistant"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+directories.workspace = true
+uuid.workspace = true

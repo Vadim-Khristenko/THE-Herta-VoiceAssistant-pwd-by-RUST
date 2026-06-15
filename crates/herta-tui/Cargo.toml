@@ -1,0 +1,19 @@
+[package]
+name = "herta-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Modern ratatui/crossterm TUI for The Herta with live sub-agent panel"
+
+[dependencies]
+herta-core.workspace = true
+herta-llm.workspace = true
+herta-tools.workspace = true
+herta-agent.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+tracing.workspace = true

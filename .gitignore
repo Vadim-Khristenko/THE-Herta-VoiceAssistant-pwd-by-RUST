@@ -29,7 +29,14 @@ htmlcov/
 .vscode/
 .idea/
 *.code-workspace
-.claude/
+.claude/*
+!.claude/skills/
+
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock.bak
+*.pdb
 
 # OS files
 .DS_Store

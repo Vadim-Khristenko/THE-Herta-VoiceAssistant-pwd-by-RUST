@@ -1,0 +1,71 @@
+# The Herta — Rust workspace.
+# Полный порт голосового ассистента «Великая Герта» на Rust.
+# Архитектура — модульная, как марионетки Герты: каждый crate автономен и заменяем.
+[workspace]
+resolver = "2"
+members = [
+    "crates/herta-core",
+    "crates/herta-llm",
+    "crates/herta-tools",
+    "crates/herta-agent",
+    "crates/herta-tui",
+    "crates/herta-cli",
+]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["VAI PROG <vadim@vai-rice.space>"]
+repository = "https://github.com/vadim-khristenko/the-herta-voiceassistant-pwd-by-rust"
+description = "The Herta — hyper-performant Rust voice assistant & TUI (Honkai: Star Rail persona)"
+
+[workspace.dependencies]
+# Внутренние crate-ы.
+herta-core = { path = "crates/herta-core" }
+herta-llm = { path = "crates/herta-llm" }
+herta-tools = { path = "crates/herta-tools" }
+herta-agent = { path = "crates/herta-agent" }
+herta-tui = { path = "crates/herta-tui" }
+
+# Async runtime и сеть.
+tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio-stream = "0.1"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# Сериализация / данные.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Ошибки / логирование.
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# CLI.
+clap = { version = "4", features = ["derive", "env"] }
+
+# TUI.
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Конфиг и окружение.
+dotenvy = "0.15"
+directories = "5"
+
+# Утилиты.
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
