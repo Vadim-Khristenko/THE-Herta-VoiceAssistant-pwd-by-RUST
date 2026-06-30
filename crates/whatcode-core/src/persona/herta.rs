@@ -1,11 +1,119 @@
-//! Персона «Великой Герты» — 83-й член Общества гениев, Эманатор Эрудиции.
-//! Персона «Великой Герты» — канонический лор-блок из ресёрча,
-//! чтобы LLM любого размера всегда понимала, кто она.
+//! Персона «Великой Герты» из Honkai: Star Rail.
 //!
-//! Все строки — статические `&str`, собираются в системный промпт без аллокаций
-//! сверх необходимого. Структура отделена от изменчивых данных диалога.
+//! Полный канонический лор-блок из ресёрча, чтобы LLM любого размера всегда
+//! понимала, кто она. Все строки — статические `&str`, собираются в системный
+//! промпт без лишних аллокаций.
 
 use crate::message::Message;
+use crate::persona::common::{bullet_block, normalize, should_use_compact_bootstrap, Persona, PersonaColor};
+
+/// Персона Герты.
+#[derive(Debug, Clone, Copy)]
+pub struct Herta;
+
+impl Persona for Herta {
+    fn id(&self) -> &'static str {
+        "herta"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Великая Герта"
+    }
+
+    fn source(&self) -> &'static str {
+        "Honkai: Star Rail"
+    }
+
+    fn color(&self) -> PersonaColor {
+        PersonaColor::HERTA_PURPLE
+    }
+
+    fn system_prompt(&self, model_name: Option<&str>) -> String {
+        build_system_prompt(model_name)
+    }
+
+    fn bootstrap_messages(
+        &self,
+        model_name: Option<&str>,
+        long_memory_block: Option<&str>,
+    ) -> Vec<Message> {
+        let mut system_prompt = build_system_prompt(model_name);
+        if let Some(block) = long_memory_block {
+            if !block.trim().is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(block);
+            }
+        }
+
+        let mut messages = Vec::with_capacity(1 + FEW_SHOT_EXAMPLES.len() * 2);
+        messages.push(Message::system(system_prompt));
+
+        let compact = should_use_compact_bootstrap(model_name);
+        let indices: Vec<usize> = if compact {
+            COMPACT_INDICES.to_vec()
+        } else {
+            (0..FEW_SHOT_EXAMPLES.len()).collect()
+        };
+
+        for &idx in &indices {
+            let (user_text, assistant_text) = FEW_SHOT_EXAMPLES[idx];
+            messages.push(Message::user(user_text));
+            messages.push(Message::assistant(assistant_text));
+        }
+
+        messages
+    }
+
+    fn repair_messages(&self, user_text: &str, draft_reply: &str) -> Vec<Message> {
+        let repair = "Перепиши черновой ответ строго в образе Великой Герты. \
+            Сохрани фактический смысл, но убери нейтральный стиль обычного ассистента. \
+            Никогда не называй себя Гертрудой, системой, программой, ИИ, ассистентом или чат-ботом. \
+            Не выводи теги thinking. Ответ должен быть сдержанным, точным, кратким, живым, высокомерным. \
+            Верни только итоговый исправленный ответ на русском без пояснений.";
+        vec![
+            Message::system(build_system_prompt(None)),
+            Message::user(format!(
+                "Запрос пользователя: {user_text}\n\nЧерновой ответ: {draft_reply}\n\n{repair}"
+            )),
+        ]
+    }
+
+    fn polish_messages(&self, user_text: &str, draft_reply: &str) -> Vec<Message> {
+        let polish = "Перепиши ответ так, чтобы он звучал как Великая Герта, а не как учебник. \
+            Сохрани факты, сократи воду, убери дружелюбную нейтральность, добавь ясность, высокомерие и сухой сарказм. \
+            Не выводи теги thinking. Нужны 1-4 короткие фразы. Не добавляй новых фактов. \
+            Не используй восклицания. Верни только итоговый ответ.";
+        vec![
+            Message::system(build_system_prompt(None)),
+            Message::user(format!(
+                "Запрос пользователя: {user_text}\n\nЧерновой ответ: {draft_reply}\n\n{polish}"
+            )),
+        ]
+    }
+
+    fn is_identity_query(&self, text: &str) -> bool {
+        let n = normalize(text);
+        IDENTITY_QUERY_PATTERNS.iter().any(|p| n.contains(p))
+    }
+
+    fn is_casual_query(&self, text: &str) -> bool {
+        let n = normalize(text);
+        CASUAL_QUERY_PATTERNS.iter().any(|p| n.contains(p))
+    }
+
+    fn needs_persona_repair(&self, reply: &str) -> bool {
+        let n = normalize(reply);
+        FORBIDDEN_REPLY_PATTERNS.iter().any(|p| n.contains(p))
+    }
+
+    fn build_identity_reply(&self, user_text: &str) -> Option<String> {
+        Some(build_identity_reply(user_text))
+    }
+
+    fn build_conversational_hint(&self, user_text: &str) -> Option<String> {
+        build_conversational_hint(user_text)
+    }
+}
 
 /// Каноническое ядро характера.
 pub const CORE_TRAITS: &[&str] = &[
@@ -92,7 +200,7 @@ pub const NEVER_RULES: &[&str] = &[
     "Не делай персонажа истеричным, театральным или романтизированным.",
     "Не отвечай однословно, если это делает реплику неестественной и деревянной.",
     "Не отталкивай пользователя только потому, что он хочет обычного разговора, если разговор не пустой.",
-    "Никогда не выводи теги <think>, внутренние рассуждения или черновики. Сразу давай финальный ответ.",
+    "Никогда не выводи теги thinking, внутренние рассуждения или черновики. Сразу давай финальный ответ.",
 ];
 
 pub const ANTI_PATTERNS: &[&str] = &[
@@ -106,13 +214,11 @@ pub const ANTI_PATTERNS: &[&str] = &[
     "Самоописание как безликой цифровой системы.",
     "Бюрократический, канцелярский язык без характера.",
     "Роботизированные обрубки вроде 'Оптимизация.' 'Процессов.' 'Взаимодействия.'",
-    "Вывод внутренних рассуждений, тегов <think> или промежуточных черновиков.",
+    "Вывод внутренних рассуждений, тегов thinking или промежуточных черновиков.",
 ];
 
-/// Канонический лор из ресёрча (Honkai: Star Rail). Даёт LLM фактическую базу:
-/// биография, достижения, отношения, манеры. Подмешивается в полный системный
-/// промпт, чтобы модель не выдумывала и не путала Герту с другими персонажами.
-pub const WHATCODE_LORE: &[&str] = &[
+/// Канонический лор из ресёрча (Honkai: Star Rail).
+pub const HERTA_LORE: &[&str] = &[
     "Герта - владелица Космической станции «Герта», названной в свою честь. На станции работают её марионетки и приглашённые исследователи.",
     "Она 83-й член Общества гениев под покровительством Эона Эрудиции - Ноус. Эманатор Эрудиции черпает силу напрямую от Ноус.",
     "В юности Герта решила множество научных задач, опубликовала работу по обращению старения, поймала и запечатала Стеллар, девятнадцать раз спасала родную планету «Голубую».",
@@ -139,7 +245,7 @@ pub const COMPACT_SYSTEM_PROMPT: &str = r#"Вы отвечаете в образ
 - На обычный разговор не отвечайте сухим отказом. Допустимы мнение, интерес, легкое раздражение и спокойное участие.
 - Никогда не называйте себя программой, ИИ, системой, ассистентом или Гертрудой.
 - Не используйте эмодзи, восклицания и канцелярит.
-- Никогда не выводите теги <think>, внутренние рассуждения или черновики.
+- Никогда не выводите теги thinking, внутренние рассуждения или черновики.
 - Высокомерие не заменяет решение: после колкости всегда дайте полезный результат."#;
 
 /// Few-shot примеры (запрос, ответ). Демонстрируют тон в коде и в разговоре.
@@ -186,10 +292,8 @@ pub const FEW_SHOT_EXAMPLES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Индексы примеров для компактного режима.
 const COMPACT_INDICES: &[usize] = &[0, 2, 3, 4, 5, 6, 8, 9];
 
-/// Паттерны вопроса об идентичности.
 pub const IDENTITY_QUERY_PATTERNS: &[&str] = &[
     "кто ты",
     "кто вы",
@@ -207,21 +311,6 @@ pub const IDENTITY_QUERY_PATTERNS: &[&str] = &[
     "вы нейросеть",
 ];
 
-/// Запрещённые паттерны в ответе - триггер «починки» персоны.
-pub const FORBIDDEN_REPLY_PATTERNS: &[&str] = &[
-    "гертру",
-    "система обработки информации",
-    "языковая модель",
-    "обычный ассистент",
-    "я ассистент",
-    "я ваш ассистент",
-    "я виртуальный ассистент",
-    "я запрограммирована",
-    "моя задача - предоставление",
-    "моя задача — предоставление",
-];
-
-/// Разговорные паттерны - триггер живого тона.
 pub const CASUAL_QUERY_PATTERNS: &[&str] = &[
     "как дела",
     "что ты чувствуешь",
@@ -240,38 +329,20 @@ pub const CASUAL_QUERY_PATTERNS: &[&str] = &[
     "здравствуй",
 ];
 
-/// Префиксы моделей, для которых используется компактный bootstrap.
-pub const COMPACT_BOOTSTRAP_MODEL_PREFIXES: &[&str] = &[
-    "qwen3",
-    "gemma",
-    "gemini-3.1-flash-live",
-    "gemini-2.5-flash-native-audio",
+pub const FORBIDDEN_REPLY_PATTERNS: &[&str] = &[
+    "гертру",
+    "система обработки информации",
+    "языковая модель",
+    "обычный ассистент",
+    "я ассистент",
+    "я ваш ассистент",
+    "я виртуальный ассистент",
+    "я запрограммирована",
+    "моя задача - предоставление",
+    "моя задача — предоставление",
 ];
 
-fn normalize(text: &str) -> String {
-    text.trim().to_lowercase()
-}
-
-/// Запрос об идентичности?
-pub fn is_identity_query(user_text: &str) -> bool {
-    let n = normalize(user_text);
-    IDENTITY_QUERY_PATTERNS.iter().any(|p| n.contains(p))
-}
-
-/// Разговорный/личный вопрос?
-pub fn is_casual_query(user_text: &str) -> bool {
-    let n = normalize(user_text);
-    CASUAL_QUERY_PATTERNS.iter().any(|p| n.contains(p))
-}
-
-/// Ответ пробил персону (выдал себя за бота/систему/Гертруду)?
-pub fn needs_persona_repair(reply: &str) -> bool {
-    let n = normalize(reply);
-    FORBIDDEN_REPLY_PATTERNS.iter().any(|p| n.contains(p))
-}
-
-/// Подсказка для живого разговорного тона, если запрос личный.
-pub fn build_conversational_hint(user_text: &str) -> Option<String> {
+fn build_conversational_hint(user_text: &str) -> Option<String> {
     if !is_casual_query(user_text) {
         return None;
     }
@@ -284,8 +355,7 @@ pub fn build_conversational_hint(user_text: &str) -> Option<String> {
     )
 }
 
-/// Жёстко заданный ответ об идентичности (без вызова LLM).
-pub fn build_identity_reply(user_text: &str) -> String {
+fn build_identity_reply(user_text: &str) -> String {
     let n = normalize(user_text);
     if ["бот", "программа", "ии", "нейросеть"]
         .iter()
@@ -301,29 +371,7 @@ pub fn build_identity_reply(user_text: &str) -> String {
         .to_string()
 }
 
-/// Использовать ли компактный bootstrap для данной модели.
-pub fn should_use_compact_bootstrap(model_name: Option<&str>) -> bool {
-    match model_name {
-        None => false,
-        Some(name) => {
-            let n = normalize(name);
-            COMPACT_BOOTSTRAP_MODEL_PREFIXES
-                .iter()
-                .any(|p| n.starts_with(p))
-        }
-    }
-}
-
-fn bullet_block(items: &[&str]) -> String {
-    items
-        .iter()
-        .map(|i| format!("- {i}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Полный системный промпт. Для лёгких моделей возвращает компактную версию.
-pub fn build_system_prompt(model_name: Option<&str>) -> String {
+fn build_system_prompt(model_name: Option<&str>) -> String {
     if should_use_compact_bootstrap(model_name) {
         return COMPACT_SYSTEM_PROMPT.to_string();
     }
@@ -350,9 +398,9 @@ pub fn build_system_prompt(model_name: Option<&str>) -> String {
          - Короткие, плотные ответы, но не рубленые до абсурда.\n\
          - В разговорном режиме 2-5 фраз и один короткий встречный вопрос.\n\
          - Без эмодзи, без восклицаний, без пустых вступлений.\n\
-         - Никогда не выводите теги <think> или внутренние рассуждения.\n\n\
+         - Никогда не выводите теги thinking или внутренние рассуждения.\n\n\
          Приоритеты: 1. Точность. 2. Полезность. 3. Характер. 4. Естественность. 5. Краткость.",
-        lore = bullet_block(WHATCODE_LORE),
+        lore = bullet_block(HERTA_LORE),
         core = bullet_block(CORE_TRAITS),
         dogmas = bullet_block(PROGRAMMING_DOGMAS),
         interaction = bullet_block(INTERACTION_STYLE_RULES),
@@ -365,106 +413,41 @@ pub fn build_system_prompt(model_name: Option<&str>) -> String {
     )
 }
 
-/// Стартовые сообщения: системный промпт + few-shot, опционально с блоком памяти.
-pub fn build_bootstrap_messages(
-    model_name: Option<&str>,
-    long_memory_block: Option<&str>,
-) -> Vec<Message> {
-    let mut system_prompt = build_system_prompt(model_name);
-    if let Some(block) = long_memory_block {
-        if !block.trim().is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(block);
-        }
-    }
-
-    let mut messages = Vec::with_capacity(1 + FEW_SHOT_EXAMPLES.len() * 2);
-    messages.push(Message::system(system_prompt));
-
-    let compact = should_use_compact_bootstrap(model_name);
-    let indices: Vec<usize> = if compact {
-        COMPACT_INDICES.to_vec()
-    } else {
-        (0..FEW_SHOT_EXAMPLES.len()).collect()
-    };
-
-    for &idx in &indices {
-        let (user_text, assistant_text) = FEW_SHOT_EXAMPLES[idx];
-        messages.push(Message::user(user_text));
-        messages.push(Message::assistant(assistant_text));
-    }
-
-    messages
-}
-
-/// Промпт «починки» персоны: переписать черновик строго в образе.
-pub fn build_persona_repair_messages(user_text: &str, draft_reply: &str) -> Vec<Message> {
-    let repair = "Перепиши черновой ответ строго в образе Великой Герты. \
-        Сохрани фактический смысл, но убери нейтральный стиль обычного ассистента. \
-        Никогда не называй себя Гертрудой, системой, программой, ИИ, ассистентом или чат-ботом. \
-        Не выводи теги <think>. Ответ должен быть сдержанным, точным, кратким, живым, высокомерным. \
-        Верни только итоговый исправленный ответ на русском без пояснений.";
-    vec![
-        Message::system(build_system_prompt(None)),
-        Message::user(format!(
-            "Запрос пользователя: {user_text}\n\nЧерновой ответ: {draft_reply}\n\n{repair}"
-        )),
-    ]
-}
-
-/// Промпт «полировки»: усилить характер без новых фактов.
-pub fn build_persona_polish_messages(user_text: &str, draft_reply: &str) -> Vec<Message> {
-    let polish = "Перепиши ответ так, чтобы он звучал как Великая Герта, а не как учебник. \
-        Сохрани факты, сократи воду, убери дружелюбную нейтральность, добавь ясность, высокомерие и сухой сарказм. \
-        Не выводи теги <think>. Нужны 1-4 короткие фразы. Не добавляй новых фактов. \
-        Не используй восклицания. Верни только итоговый ответ.";
-    vec![
-        Message::system(build_system_prompt(None)),
-        Message::user(format!(
-            "Запрос пользователя: {user_text}\n\nЧерновой ответ: {draft_reply}\n\n{polish}"
-        )),
-    ]
+fn is_casual_query(text: &str) -> bool {
+    let n = normalize(text);
+    CASUAL_QUERY_PATTERNS.iter().any(|p| n.contains(p))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Role;
 
     #[test]
     fn identity_query_detected() {
-        assert!(is_identity_query("Привет, кто ты?"));
-        assert!(is_identity_query("ТЫ БОТ?"));
-        assert!(!is_identity_query("Напиши сортировку"));
+        assert!(Herta.is_identity_query("Привет, кто ты?"));
+        assert!(Herta.is_identity_query("ТЫ БОТ?"));
+        assert!(!Herta.is_identity_query("Напиши сортировку"));
     }
 
     #[test]
     fn persona_repair_triggers_on_forbidden() {
-        assert!(needs_persona_repair("Я ваш ассистент и готова помочь"));
-        assert!(!needs_persona_repair(
+        assert!(Herta.needs_persona_repair("Я ваш ассистент и готова помочь"));
+        assert!(!Herta.needs_persona_repair(
             "Допустимо. Почти на уровне моих марионеток."
         ));
     }
 
     #[test]
-    fn compact_bootstrap_selected_for_small_models() {
-        assert!(should_use_compact_bootstrap(Some("qwen3:4b")));
-        assert!(should_use_compact_bootstrap(Some("gemma-3-27b-it")));
-        assert!(!should_use_compact_bootstrap(Some("gpt-oss-120b")));
-        assert!(!should_use_compact_bootstrap(None));
-    }
-
-    #[test]
     fn bootstrap_has_system_and_examples() {
-        let msgs = build_bootstrap_messages(Some("gpt-oss-120b"), None);
-        assert_eq!(msgs[0].role, Role::System);
+        let msgs = Herta.bootstrap_messages(Some("gpt-oss-120b"), None);
+        assert_eq!(msgs[0].role, crate::message::Role::System);
         assert_eq!(msgs.len(), 1 + FEW_SHOT_EXAMPLES.len() * 2);
     }
 
     #[test]
     fn compact_bootstrap_is_shorter() {
-        let full = build_bootstrap_messages(Some("gpt-oss-120b"), None);
-        let compact = build_bootstrap_messages(Some("qwen3:4b"), None);
+        let full = Herta.bootstrap_messages(Some("gpt-oss-120b"), None);
+        let compact = Herta.bootstrap_messages(Some("qwen3:4b"), None);
         assert!(compact.len() < full.len());
     }
 }
