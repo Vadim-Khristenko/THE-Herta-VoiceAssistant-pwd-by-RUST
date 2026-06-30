@@ -41,6 +41,7 @@ impl Voice {
             TtsProvider::GoogleCloud => cfg.google_api_key.is_some(),
             TtsProvider::Azure => cfg.azure_api_key.is_some() && cfg.azure_region.is_some(),
             TtsProvider::Qwen => cfg.qwen_api_key.is_some(),
+            TtsProvider::Edge => crate::which("edge-tts"),
         };
         Self {
             enabled: cfg.enabled && available,
@@ -62,6 +63,7 @@ impl Voice {
                 self.cfg.azure_api_key.is_some() && self.cfg.azure_region.is_some()
             }
             TtsProvider::Qwen => self.cfg.qwen_api_key.is_some(),
+            TtsProvider::Edge => crate::which("edge-tts"),
         }
     }
 
@@ -84,7 +86,8 @@ impl Voice {
             TtsProvider::ElevenLabs
             | TtsProvider::GoogleCloud
             | TtsProvider::Azure
-            | TtsProvider::Qwen => {
+            | TtsProvider::Qwen
+            | TtsProvider::Edge => {
                 let voice = self.clone();
                 let owned = trimmed.to_string();
                 // Облачный синтез асинхронный — не блокируем вызывающего.

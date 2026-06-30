@@ -383,6 +383,8 @@ pub enum TtsProvider {
     Azure,
     /// Alibaba Qwen / DashScope TTS (облачный, требует API-ключ).
     Qwen,
+    /// Microsoft Edge TTS — бесплатный облачный синтез через edge-tts CLI.
+    Edge,
 }
 
 impl TtsProvider {
@@ -392,6 +394,7 @@ impl TtsProvider {
             "google" | "google_cloud" | "gcloud" => Self::GoogleCloud,
             "azure" | "microsoft" => Self::Azure,
             "qwen" | "dashscope" | "alibaba" => Self::Qwen,
+            "edge" | "edge_tts" | "edge-tts" => Self::Edge,
             _ => Self::System,
         }
     }
@@ -428,6 +431,11 @@ pub struct VoiceConfig {
     pub qwen_voice: Option<String>,
     pub qwen_model: Option<String>,
     pub qwen_base_url: Option<String>,
+    /// Microsoft Edge TTS: голос, скорость, громкость, тон.
+    pub edge_voice: Option<String>,
+    pub edge_rate: Option<String>,
+    pub edge_volume: Option<String>,
+    pub edge_pitch: Option<String>,
 }
 
 /// Провайдер распознавания речи (STT). Работает по аудиофайлу: локально (Whisper
@@ -793,6 +801,10 @@ impl AppConfig {
             qwen_voice: env_opt("QWEN_TTS_VOICE"),
             qwen_model: env_opt("QWEN_TTS_MODEL"),
             qwen_base_url: env_opt("QWEN_BASE_URL"),
+            edge_voice: env_opt("EDGE_TTS_VOICE"),
+            edge_rate: env_opt("EDGE_TTS_RATE"),
+            edge_volume: env_opt("EDGE_TTS_VOLUME"),
+            edge_pitch: env_opt("EDGE_TTS_PITCH"),
         };
 
         cfg.stt = SttConfig {

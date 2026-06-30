@@ -39,20 +39,42 @@ impl GitContext {
 
     /// Выполнить git-подкоманду с аргументами.
     pub async fn git(&self, tool: &'static str, args: &[&str]) -> ToolResult {
-        match run_capture("git", args, Some(&self.repo_root), TIMEOUT_SECS).await {
+        self.git_with_timeout(tool, args, TIMEOUT_SECS).await
+    }
+
+    /// Для команд, которые могут занимать больше времени (push/pull/rebase).
+    pub async fn git_long(&self, tool: &'static str, args: &[&str]) -> ToolResult {
+        self.git_with_timeout(tool, args, LONG_TIMEOUT_SECS).await
+    }
+
+    /// Выполнить git с явным таймаутом.
+    async fn git_with_timeout(
+        &self,
+        tool: &'static str,
+        args: &[&str],
+        timeout_secs: u64,
+    ) -> ToolResult {
+        match run_capture("git", args, Some(&self.repo_root), timeout_secs).await {
             Ok(out) if out.combined.is_empty() => ToolResult::ok(tool, "(пусто)"),
             Ok(out) => ToolResult::ok(tool, out.combined),
             Err(e) => ToolResult::rejected(tool, e),
         }
     }
 
-    /// Для команд, которые могут занимать больше времени (push/pull/rebase).
-    pub async fn git_long(&self, tool: &'static str, args: &[&str]) -> ToolResult {
-        match run_capture("git", args, Some(&self.repo_root), LONG_TIMEOUT_SECS).await {
-            Ok(out) if out.combined.is_empty() => ToolResult::ok(tool, "(пусто)"),
-            Ok(out) => ToolResult::ok(tool, out.combined),
-            Err(e) => ToolResult::rejected(tool, e),
+    /// Выполнить git-команду с одним дополнительным проверенным аргументом.
+    /// Если аргумент не проходит валидацию, возвращает `ToolResult::rejected`.
+    pub async fn git_safe_arg(
+        &self,
+        tool: &'static str,
+        args: &[&str],
+        extra: &str,
+    ) -> ToolResult {
+        if !Self::safe_arg(extra) {
+            return ToolResult::rejected(tool, "аргумент не должен содержать `..` или начинаться с `-`");
         }
+        let mut full = args.to_vec();
+        full.push(extra);
+        self.git(tool, &full).await
     }
 
     /// Проверить, что строка безопасна для передачи как аргумент git.

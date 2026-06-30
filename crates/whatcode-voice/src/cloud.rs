@@ -20,6 +20,7 @@ pub async fn synthesize_and_play(
         TtsProvider::GoogleCloud => (google(http, cfg, text).await?, "mp3"),
         TtsProvider::Azure => (azure(http, cfg, text).await?, "mp3"),
         TtsProvider::Qwen => (qwen(http, cfg, text).await?, "mp3"),
+        TtsProvider::Edge => (edge(cfg, text).await?, "mp3"),
         TtsProvider::System => return Err("system-провайдер не использует облако".into()),
     };
     let path = write_temp(&bytes, ext)?;
@@ -127,6 +128,47 @@ async fn azure(http: &reqwest::Client, cfg: &VoiceConfig, text: &str) -> Result<
         return Err(format!("Azure TTS HTTP {}", resp.status().as_u16()));
     }
     Ok(resp.bytes().await.map_err(|e| e.to_string())?.to_vec())
+}
+
+/// Microsoft Edge TTS через `edge-tts` CLI.
+async fn edge(cfg: &VoiceConfig, text: &str) -> Result<Vec<u8>, String> {
+    let out = write_temp(&[], "mp3")?;
+    let out_str = out.to_string_lossy().to_string();
+    let voice = cfg.edge_voice.as_deref().unwrap_or("ru-RU-SvetlanaNeural");
+    let mut args = vec![
+        "--text".to_string(),
+        text.to_string(),
+        "--voice".to_string(),
+        voice.to_string(),
+        "--write-media".to_string(),
+        out_str,
+    ];
+    if let Some(rate) = &cfg.edge_rate {
+        args.push("--rate".to_string());
+        args.push(rate.clone());
+    }
+    if let Some(volume) = &cfg.edge_volume {
+        args.push("--volume".to_string());
+        args.push(volume.clone());
+    }
+    if let Some(pitch) = &cfg.edge_pitch {
+        args.push("--pitch".to_string());
+        args.push(pitch.clone());
+    }
+
+    let status = tokio::process::Command::new("edge-tts")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("не удалось запустить `edge-tts`: {e}. Установите: uv pip install edge-tts"))?;
+    if !status.success() {
+        return Err("`edge-tts` завершился с ошибкой".into());
+    }
+    tokio::fs::read(&out)
+        .await
+        .map_err(|e| format!("не удалось прочитать результат edge-tts: {e}"))
 }
 
 /// Alibaba Qwen / DashScope TTS (международный эндпоинт по умолчанию).

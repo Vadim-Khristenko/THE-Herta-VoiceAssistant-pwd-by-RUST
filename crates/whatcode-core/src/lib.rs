@@ -21,6 +21,7 @@ pub mod mode;
 pub mod persona;
 pub mod skill;
 pub mod tool;
+pub mod wakeword;
 
 pub use config::{AppConfig, LlmProvider};
 pub use context::{CompactionDecision, CompactionPlan, ContextManager};

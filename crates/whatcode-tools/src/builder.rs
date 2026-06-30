@@ -33,51 +33,74 @@ fn skills_dir() -> String {
         .unwrap_or_else(|| "skills".to_string())
 }
 
+/// Описание одного процесс-инструмента для bulk-регистрации.
+struct ProcessToolDef {
+    name: &'static str,
+    description: &'static str,
+    program: &'static str,
+    base_args: &'static [&'static str],
+    timeout_secs: u64,
+}
+
+/// Зарегистрировать несколько `ProcessTool` с заданным уровнем риска.
+fn register_process_tools(reg: &mut ToolRegistry, tools: &[ProcessToolDef], risk: ToolRisk) {
+    for t in tools {
+        reg.register(Arc::new(ProcessTool::new(
+            t.name,
+            t.description,
+            t.program,
+            t.base_args.to_vec(),
+            risk,
+            t.timeout_secs,
+        )));
+    }
+}
+
 /// Зарегистрировать инструменты автономной разработки на Rust (cargo).
 fn register_cargo(reg: &mut ToolRegistry) {
-    let w = ToolRisk::Write;
-    let tools: Vec<ProcessTool> = vec![
-        ProcessTool::new("cargo_check", "Быстрая проверка компиляции Rust-проекта без сборки артефактов (`cargo check`). Используй часто во время правок.", "cargo", vec!["check"], w, 300),
-        ProcessTool::new("cargo_build", "Собрать Rust-проект (`cargo build`). Доп. аргументы: например `--release`.", "cargo", vec!["build"], w, 600),
-        ProcessTool::new("cargo_test", "Запустить тесты Rust-проекта (`cargo test`). Можно указать имя теста в args.", "cargo", vec!["test"], w, 600),
-        ProcessTool::new("cargo_clippy", "Линтер Rust (`cargo clippy --all-targets`). Показывает предупреждения и ошибки качества.", "cargo", vec!["clippy", "--all-targets"], w, 600),
-        ProcessTool::new("cargo_fmt", "Отформатировать код Rust (`cargo fmt`). Изменяет файлы. Для проверки используй args `--check`.", "cargo", vec!["fmt"], w, 120),
-        ProcessTool::new("cargo_add", "Добавить зависимость в Cargo.toml (`cargo add <crate>`). Имя крейта передай в args.", "cargo", vec!["add"], w, 120),
-        ProcessTool::new("cargo_run", "Запустить бинарь проекта (`cargo run`). Аргументы программы — после `--` в args.", "cargo", vec!["run"], w, 600),
-    ];
-    for t in tools {
-        reg.register(Arc::new(t));
-    }
+    register_process_tools(
+        reg,
+        &[
+            ProcessToolDef { name: "cargo_check", description: "Быстрая проверка компиляции Rust-проекта без сборки артефактов (`cargo check`). Используй часто во время правок.", program: "cargo", base_args: &["check"], timeout_secs: 300 },
+            ProcessToolDef { name: "cargo_build", description: "Собрать Rust-проект (`cargo build`). Доп. аргументы: например `--release`.", program: "cargo", base_args: &["build"], timeout_secs: 600 },
+            ProcessToolDef { name: "cargo_test", description: "Запустить тесты Rust-проекта (`cargo test`). Можно указать имя теста в args.", program: "cargo", base_args: &["test"], timeout_secs: 600 },
+            ProcessToolDef { name: "cargo_clippy", description: "Линтер Rust (`cargo clippy --all-targets`). Показывает предупреждения и ошибки качества.", program: "cargo", base_args: &["clippy", "--all-targets"], timeout_secs: 600 },
+            ProcessToolDef { name: "cargo_fmt", description: "Отформатировать код Rust (`cargo fmt`). Изменяет файлы. Для проверки используй args `--check`.", program: "cargo", base_args: &["fmt"], timeout_secs: 120 },
+            ProcessToolDef { name: "cargo_add", description: "Добавить зависимость в Cargo.toml (`cargo add <crate>`). Имя крейта передай в args.", program: "cargo", base_args: &["add"], timeout_secs: 120 },
+            ProcessToolDef { name: "cargo_run", description: "Запустить бинарь проекта (`cargo run`). Аргументы программы — после `--` в args.", program: "cargo", base_args: &["run"], timeout_secs: 600 },
+        ],
+        ToolRisk::Write,
+    );
 }
 
 /// Зарегистрировать инструменты Python через UV-менеджер.
 fn register_uv(reg: &mut ToolRegistry) {
-    let w = ToolRisk::Write;
-    let tools: Vec<ProcessTool> = vec![
-        ProcessTool::new("uv_run", "Запустить Python-команду/скрипт в окружении проекта через UV (`uv run`). Команда — в args.", "uv", vec!["run"], w, 600),
-        ProcessTool::new("uv_add", "Добавить Python-зависимость через UV (`uv add <pkg>`). Имя пакета — в args.", "uv", vec!["add"], w, 300),
-        ProcessTool::new("uv_sync", "Синхронизировать окружение Python по lock-файлу (`uv sync`).", "uv", vec!["sync"], w, 600),
-        ProcessTool::new("uv_pip", "Управление пакетами в стиле pip через UV (`uv pip ...`). Подкоманду и аргументы передай в args, напр. `install requests`.", "uv", vec!["pip"], w, 600),
-    ];
-    for t in tools {
-        reg.register(Arc::new(t));
-    }
+    register_process_tools(
+        reg,
+        &[
+            ProcessToolDef { name: "uv_run", description: "Запустить Python-команду/скрипт в окружении проекта через UV (`uv run`). Команда — в args.", program: "uv", base_args: &["run"], timeout_secs: 600 },
+            ProcessToolDef { name: "uv_add", description: "Добавить Python-зависимость через UV (`uv add <pkg>`). Имя пакета — в args.", program: "uv", base_args: &["add"], timeout_secs: 300 },
+            ProcessToolDef { name: "uv_sync", description: "Синхронизировать окружение Python по lock-файлу (`uv sync`).", program: "uv", base_args: &["sync"], timeout_secs: 600 },
+            ProcessToolDef { name: "uv_pip", description: "Управление пакетами в стиле pip через UV (`uv pip ...`). Подкоманду и аргументы передай в args, напр. `install requests`.", program: "uv", base_args: &["pip"], timeout_secs: 600 },
+        ],
+        ToolRisk::Write,
+    );
 }
 
 /// Зарегистрировать инструменты TypeScript/JavaScript через Bun.
 fn register_bun(reg: &mut ToolRegistry) {
-    let w = ToolRisk::Write;
-    let tools: Vec<ProcessTool> = vec![
-        ProcessTool::new("bun_run", "Запустить скрипт через Bun (`bun run`). Имя скрипта/команды — в args.", "bun", vec!["run"], w, 600),
-        ProcessTool::new("bun_test", "Запустить тесты через Bun (`bun test`). Фильтр — в args.", "bun", vec!["test"], w, 600),
-        ProcessTool::new("bun_build", "Собрать проект через Bun (`bun build`). Аргументы — в args.", "bun", vec!["build"], w, 600),
-        ProcessTool::new("bun_add", "Добавить npm-зависимость через Bun (`bun add <pkg>`). Имя пакета — в args.", "bun", vec!["add"], w, 300),
-        ProcessTool::new("bun_install", "Установить зависимости через Bun (`bun install`).", "bun", vec!["install"], w, 600),
-        ProcessTool::new("bun_lint", "Проверить код через Bun-линтер (`bun lint` или `bun x eslint`). Команда — в args.", "bun", vec!["lint"], w, 300),
-    ];
-    for t in tools {
-        reg.register(Arc::new(t));
-    }
+    register_process_tools(
+        reg,
+        &[
+            ProcessToolDef { name: "bun_run", description: "Запустить скрипт через Bun (`bun run`). Имя скрипта/команды — в args.", program: "bun", base_args: &["run"], timeout_secs: 600 },
+            ProcessToolDef { name: "bun_test", description: "Запустить тесты через Bun (`bun test`). Фильтр — в args.", program: "bun", base_args: &["test"], timeout_secs: 600 },
+            ProcessToolDef { name: "bun_build", description: "Собрать проект через Bun (`bun build`). Аргументы — в args.", program: "bun", base_args: &["build"], timeout_secs: 600 },
+            ProcessToolDef { name: "bun_add", description: "Добавить npm-зависимость через Bun (`bun add <pkg>`). Имя пакета — в args.", program: "bun", base_args: &["add"], timeout_secs: 300 },
+            ProcessToolDef { name: "bun_install", description: "Установить зависимости через Bun (`bun install`).", program: "bun", base_args: &["install"], timeout_secs: 600 },
+            ProcessToolDef { name: "bun_lint", description: "Проверить код через Bun-линтер (`bun lint` или `bun x eslint`). Команда — в args.", program: "bun", base_args: &["lint"], timeout_secs: 300 },
+        ],
+        ToolRisk::Write,
+    );
 }
 
 /// Построить полный реестр инструментов для агента в заданном режиме.
